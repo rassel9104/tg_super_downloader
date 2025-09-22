@@ -230,7 +230,3 @@ tg_super_downloader/
   ```
 
 ---
-
-## 📜 Licencia
-
-MIT (opcional).

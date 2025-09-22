@@ -1,0 +1,31 @@
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+*.db
+.venv/
+.env
+*.log
+
+# VSCode
+.vscode/
+
+# Downloads & data
+downloads/
+data/
+*.session
+*.session-journal
+*.part
+*.ytdl
+*.ytdl.part
+
+# Coverage / tests
+htmlcov/
+.coverage
+.pytest_cache/
+
+# Tools
+tools/

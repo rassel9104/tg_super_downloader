@@ -1,0 +1,25 @@
+# Directorio por defecto; el proyecto lo sobrescribe con --dir si hace falta
+dir=./downloads
+
+# Sesión persistente (reanudar)
+save-session=./data/aria2.session
+input-file=./data/aria2.session
+continue=true
+auto-file-renaming=false
+
+# Rendimiento razonable
+max-concurrent-downloads=5
+max-connection-per-server=16
+split=16
+min-split-size=1M
+file-allocation=none
+
+# RPC
+enable-rpc=true
+rpc-listen-port=6800
+rpc-listen-all=false
+# Define un secret en .env (ARIA2_SECRET). Si lo dejas vacío, comenta esta línea:
+rpc-secret=D0wnl04d3r
+
+# SSL
+check-certificate=false

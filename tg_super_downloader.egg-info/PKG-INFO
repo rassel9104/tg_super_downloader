@@ -1,0 +1,45 @@
+Metadata-Version: 2.4
+Name: tg-super-downloader
+Version: 0.1.0
+Summary: Telegram advanced downloader (Telethon + aria2 + yt-dlp) with panel
+Requires-Python: >=3.13
+Description-Content-Type: text/markdown
+Requires-Dist: python-dotenv>=1.0.1
+Requires-Dist: pydantic>=2.9.2
+Requires-Dist: pydantic-settings>=2.6.1
+Requires-Dist: fastapi>=0.115.0
+Requires-Dist: uvicorn[standard]>=0.30.6
+Requires-Dist: telethon>=1.36.0
+Requires-Dist: python-telegram-bot>=21.4
+Requires-Dist: APScheduler>=3.10.4
+Requires-Dist: requests>=2.32.3
+Requires-Dist: tenacity>=9.0.0
+Requires-Dist: prometheus-client>=0.21.0
+Requires-Dist: structlog>=24.4.0
+Requires-Dist: yt-dlp>=2025.0.0
+Requires-Dist: typing-extensions>=4.12.2
+Provides-Extra: dev
+Requires-Dist: ruff>=0.6.9; extra == "dev"
+Requires-Dist: black>=24.8.0; extra == "dev"
+Requires-Dist: mypy>=1.11.2; extra == "dev"
+Requires-Dist: pytest>=8.3.3; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.24.0; extra == "dev"
+Requires-Dist: alembic>=1.13.2; extra == "dev"
+
+# TG Super Downloader — Bootstrap
+
+Este repo parte de:
+- Bot Telegram (Bot API + Telethon) con cola SQLite y scheduler diario.  (Código previo de referencia)  :contentReference[oaicite:10]{index=10}
+- Generación de `TELETHON_STRING` vía script.  :contentReference[oaicite:11]{index=11}
+- Dashboard inicial en Flask (migrará a FastAPI).  :contentReference[oaicite:12]{index=12}
+- Módulo yt-dlp con fallback a binario.  :contentReference[oaicite:13]{index=13}
+
+## Requisitos
+- Windows 11, Python 3.13 (`py`), PowerShell.
+
+## Instalación
+```powershell
+git clone <este-repo>
+cd tg-super-downloader
+powershell -ExecutionPolicy Bypass -File .\scripts\setup.ps1
+copy .env.example .env

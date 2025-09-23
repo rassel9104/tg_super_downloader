@@ -1,6 +1,8 @@
 import argparse
 import asyncio
+import sys
 from tgdl.config.settings import settings
+
 
 def main():
     parser = argparse.ArgumentParser("tgdl")
@@ -13,18 +15,47 @@ def main():
     args = parser.parse_args()
 
     if args.cmd == "panel":
-        import uvicorn
-        uvicorn.run("tgdl.panel.api:app",
-                    host=settings.PANEL_HOST, port=settings.PANEL_PORT, reload=False)
+        try:
+            import uvicorn
+
+            # Nota: en Windows, Ctrl+C lanza KeyboardInterrupt; lo manejamos abajo.
+            uvicorn.run(
+                "tgdl.panel.api:app",
+                host=settings.PANEL_HOST,
+                port=settings.PANEL_PORT,
+                reload=False,
+                # loop="asyncio"  # (opcional) explícito; uvicorn detecta asyncio por defecto
+            )
+            return 0
+        except KeyboardInterrupt:
+            print("\n[i] Panel detenido por el usuario.")
+            return 0
+        except Exception as e:
+            print(f"[!] Error al iniciar el panel: {e!r}")
+            return 1
 
     elif args.cmd == "bot":
-        from tgdl.adapters.telegram.bot_app import main as bot_main
-        asyncio.run(bot_main())
+        try:
+            from tgdl.adapters.telegram.bot_app import main as bot_main
+
+            asyncio.run(bot_main())
+            return 0
+        except KeyboardInterrupt:
+            print("\n[i] Bot detenido por el usuario.")
+            return 0
+        except Exception as e:
+            print(f"[!] Error al iniciar el bot: {e!r}")
+            return 1
 
     elif args.cmd == "control":
         print("Los endpoints de control viven ahora en 127.0.0.1:8765 y arrancan junto al bot.")
+        return 0
+
     else:
         parser.print_help()
+        # código 2 suele indicar 'uso incorrecto de CLI'
+        return 2
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

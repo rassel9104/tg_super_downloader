@@ -9,6 +9,8 @@ from typing import Any
 
 from urllib.parse import urlparse
 
+from telegram.error import BadRequest
+
 from zoneinfo import ZoneInfo
 from fastapi import FastAPI
 import uvicorn
@@ -34,6 +36,7 @@ from tgdl.config.settings import settings
 from tgdl.core.db import (
     db_init,
     db_set_flag,
+    db_get_flag,
     is_paused,
     db_add,
     db_get_due,
@@ -46,6 +49,9 @@ from tgdl.core.db import (
     db_update_progress,
     db_clear_progress,
     db_clear_all,  # <- NUEVO
+    db_get_progress_rows,  # <— NUEVO (para notificaciones)
+    db_set_ext_id,
+    _connect,
 )
 
 from tgdl.adapters.downloaders.aria2 import remove as aria2_remove
@@ -114,6 +120,31 @@ def _slugify(name: str) -> str:
     # minimal slug seguro para rutas
     out = "".join(c if c.isalnum() or c in " ._-+" else "_" for c in name.strip())
     return re.sub(r"\s+", " ", out).strip()
+
+
+async def safe_edit(
+    query,
+    text=None,
+    reply_markup=None,
+    parse_mode: str | None = ParseMode.HTML,
+    disable_web_page_preview: bool | None = True,
+):
+    """Edita un mensaje y silencia el error 'Message is not modified'."""
+    try:
+        await query.edit_message_text(
+            text=text if text is not None else (query.message.text or ""),
+            reply_markup=reply_markup if reply_markup is not None else query.message.reply_markup,
+            parse_mode=parse_mode,
+            disable_web_page_preview=disable_web_page_preview,
+        )
+    except BadRequest as e:
+        if "message is not modified" in str(e).lower():
+            try:
+                await query.answer("Sin cambios")
+            except Exception:
+                pass
+        else:
+            raise
 
 
 async def _infer_channel_title(entity, msg) -> str:
@@ -241,7 +272,8 @@ def mk_main_menu(paused: bool) -> InlineKeyboardMarkup:
         InlineKeyboardButton(
             ("▶️ Reanudar" if paused else "⏸️ Pausar"),
             callback_data=("act:resume" if paused else "act:pause"),
-        )
+        ),
+        InlineKeyboardButton("🗓️ Schedule", callback_data="act:sched:open"),  # <— nuevo
     ]
     return InlineKeyboardMarkup([row1, row2, row3])
 
@@ -295,8 +327,52 @@ class BotCtx:
 
 BOT = BotCtx(app=None, loop=None, tclient=None)
 
-# ========= Ciclo en Progreso? =========
-RUN_TASK: asyncio.Task | None = None
+# ========= Scheduler / Flags persistentes =========
+SCHEDULER = None  # se setea en main()
+
+
+def get_flag_int(key: str, default: int) -> int:
+    try:
+        v = int(db_get_flag(key, str(default)))
+        return v
+    except Exception:
+        return default
+
+
+def load_sched_config():
+    """Lee configuración persistente de horario/ventana."""
+    start = get_flag_int("SCHEDULE_HOUR", settings.SCHEDULE_HOUR)
+    enabled = db_get_flag("SCHED_ENABLED", "1") == "1"
+    s_start = get_flag_int("SCHED_START", start)
+    s_stop = get_flag_int("SCHED_STOP", (start + 3) % 24)  # por defecto ventana de 3h
+    return {
+        "start": start,
+        "enabled": enabled,
+        "win_start": s_start,
+        "win_stop": s_stop,
+    }
+
+
+def reconfigure_scheduler(app):
+    """Reconstruye el scheduler según flags persistentes."""
+    global SCHEDULER
+    if SCHEDULER is None:
+        # Aún no ha sido inicializado; evita AttributeError si se llama antes de tiempo
+        return
+
+    cfg = load_sched_config()
+    from apscheduler.triggers.cron import CronTrigger
+
+    SCHEDULER.remove_all_jobs()
+
+    if cfg["enabled"]:
+        SCHEDULER.add_job(run_cycle, CronTrigger(hour=cfg["win_start"], minute=0), args=[app])
+
+        def _auto_pause():
+            db_set_flag("PAUSED", "1")
+
+        SCHEDULER.add_job(_auto_pause, CronTrigger(hour=cfg["win_stop"], minute=0))
+    # Si no hay ventana (24/7), no programamos nada periódico aquí.
 
 
 async def launch_cycle_background(app, force_all: bool = False, notify_chat_id: int | None = None):
@@ -314,6 +390,39 @@ async def launch_cycle_background(app, force_all: bool = False, notify_chat_id: 
 # ========= Ciclo programado =========
 
 
+async def _progress_notifier(app, chat_id, stop_evt: asyncio.Event):
+    last_sent: dict[int, float] = {}
+    while not stop_evt.is_set():
+        rows = db_get_progress_rows(50)
+        now = asyncio.get_event_loop().time()
+        lines = []
+        count = 0
+        for r in rows:
+            qid = r["qid"]
+            total = r.get("total") or 0
+            done = r.get("downloaded") or 0
+            if total <= 0 or done <= 0:
+                continue
+            if (now - last_sent.get(qid, 0)) < 12:
+                continue
+            last_sent[qid] = now
+            pct = done / total * 100.0
+            lines.append(
+                f"#{qid} {pct:.1f}%  {done / 1024 / 1024:.1f}MB / {total / 1024 / 1024:.1f}MB"
+            )
+            count += 1
+            if count >= 5:
+                break
+        if lines:
+            try:
+                await app.bot.send_message(
+                    chat_id=chat_id, text="⏳ Progreso:\n" + "\n".join(lines)
+                )
+            except Exception as e:
+                print(f"[DBG] notify progress error: {e!r}")
+        await asyncio.sleep(3)
+
+
 async def run_cycle(app, force_all: bool = False, notify_chat_id: int | None = None):
     outdir = Path(settings.DOWNLOAD_DIR)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -327,6 +436,14 @@ async def run_cycle(app, force_all: bool = False, notify_chat_id: int | None = N
 
     now = datetime.now(tz=TZ)
     rows = db_get_all_queued() if force_all else db_get_due(now)
+
+    notify_stop_evt = asyncio.Event()
+    notifier_task = None
+    if notify_chat_id:
+        notifier_task = asyncio.create_task(
+            _progress_notifier(app, notify_chat_id, notify_stop_evt)
+        )
+
     print(f"[DBG] run_cycle start | force_all={force_all} | items={len(rows)}")
 
     tclient: TelegramClient = BOT.tclient
@@ -364,7 +481,6 @@ async def run_cycle(app, force_all: bool = False, notify_chat_id: int | None = N
                             )
 
                             gid = aria2_add_torrent(tpath, outdir)
-                            from tgdl.core.db import db_set_ext_id
 
                             db_set_ext_id(qid, gid)
                             try:
@@ -390,7 +506,6 @@ async def run_cycle(app, force_all: bool = False, notify_chat_id: int | None = N
                             if aria2_enabled():
                                 try:
                                     gid = aria2_add(url, outdir)
-                                    from tgdl.core.db import db_set_ext_id
 
                                     db_set_ext_id(qid, gid)
                                     ok = True
@@ -427,7 +542,6 @@ async def run_cycle(app, force_all: bool = False, notify_chat_id: int | None = N
                                 )
 
                                 gid = aria2_add_torrent(res, outdir)
-                                from tgdl.core.db import db_set_ext_id
 
                                 db_set_ext_id(qid, gid)
                                 # Borra el .torrent si ya no lo quieres
@@ -467,7 +581,6 @@ async def run_cycle(app, force_all: bool = False, notify_chat_id: int | None = N
                                 )
 
                                 gid = aria2_add_torrent(res, outdir)
-                                from tgdl.core.db import db_set_ext_id
 
                                 db_set_ext_id(qid, gid)
                                 # Borra el .torrent si ya no lo quieres
@@ -508,7 +621,6 @@ async def run_cycle(app, force_all: bool = False, notify_chat_id: int | None = N
                                 )
 
                                 gid = aria2_add_torrent(res, outdir)
-                                from tgdl.core.db import db_set_ext_id
 
                                 db_set_ext_id(qid, gid)
                                 # Borra el .torrent si ya no lo quieres
@@ -555,6 +667,13 @@ async def run_cycle(app, force_all: bool = False, notify_chat_id: int | None = N
         except Exception as e:
             print(f"[DBG] worker fail: {e!r}")
 
+    if notifier_task:
+        notify_stop_evt.set()
+        try:
+            await notifier_task
+        except Exception:
+            pass
+
     print("[DBG] run_cycle end")
     RUNNING["ytdlp_proc"] = None
     PAUSE_EVT.clear()
@@ -577,22 +696,17 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (
         "🆘 <b>Ayuda rápida</b>\n\n"
         "<b>Qué puedo enviar:</b>\n"
-        "• Link de mensaje de Telegram (<code>https://t.me/c/.../123</code>)\n"
+        "• Link de Telegram (<code>https://t.me/c/.../123</code>)\n"
         "• URLs http/https/magnet (aria2)\n"
-        "• YouTube/compatibles (yt-dlp)\n"
+        "• YouTube (yt-dlp)\n"
         "• Medios reenviados\n\n"
         "<b>Comandos útiles:</b>\n"
         "<code>/menu</code> — mostrar botones\n"
-        "<code>/when HH</code> — cambia la hora (24h)\n"
+        "<code>/schedule</code> — 24/7 o ventana horaria (Start/Stop)\n"
+        "<code>/when HH</code> — cambia la hora base (persistente)\n"
         "<code>/now</code> — ejecutar ciclo ya\n"
-        "<code>/pause</code> — pausar todo\n"
-        "<code>/resume</code> — reanudar\n"
-        "<code>/status</code> — ver estado\n"
-        "<code>/list</code> — ver cola\n"
-        "<code>/retry</code> — reintentar errores\n"
-        "<code>/purge</code> — limpiar done/error\n"
-        "<code>/cancel ID</code> — cancelar ítem\n"
-        "<code>/clear</code> — limpiar TODO\n"
+        "<code>/pause</code>, <code>/resume</code>\n"
+        "<code>/status</code>, <code>/list</code>, <code>/retry</code>, <code>/purge</code>, <code>/cancel ID</code>, <code>/clear</code>\n"
     )
     await update.message.reply_text(txt, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
@@ -628,17 +742,13 @@ async def cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data == "act:pause":
             await cmd_pause(update, context)
             txt, kb = refresh_menu_html()
-            await query.edit_message_text(txt, parse_mode=ParseMode.HTML, reply_markup=kb)
+            await safe_edit(query, txt, kb)
         elif data == "act:resume":
             await cmd_resume(update, context)
             txt, kb = refresh_menu_html()
-            await query.edit_message_text(txt, parse_mode=ParseMode.HTML, reply_markup=kb)
+            await safe_edit(query, txt, kb)
         elif data == "act:status":
-            await query.edit_message_text(
-                fmt_status_message_html(),
-                parse_mode=ParseMode.HTML,
-                reply_markup=mk_main_menu(is_paused()),
-            )
+            await safe_edit(query, fmt_status_message_html(), mk_main_menu(is_paused()))
         elif data == "act:list":
             rows = db_list(limit=15)
             if not rows:
@@ -668,6 +778,51 @@ async def cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML,
                 reply_markup=mk_when_menu(),
             )
+
+        elif data == "act:sched:always":
+            db_set_flag("SCHED_ENABLED", "0")
+            reconfigure_scheduler(context.application)
+            txt, kb = mk_sched_menu()
+            await safe_edit(query, txt, kb)
+
+        elif data == "act:sched:open":
+            txt, kb = mk_sched_menu()
+            await safe_edit(query, txt, kb)
+
+        elif data == "act:sched:window":
+            db_set_flag("SCHED_ENABLED", "1")
+            reconfigure_scheduler(context.application)
+            txt, kb = mk_sched_menu()
+            await safe_edit(query, txt, kb)
+
+        elif data.startswith("act:sched:start:"):
+            try:
+                h = int(data.split(":")[-1])
+                assert 0 <= h < 24
+                db_set_flag("SCHED_START", str(h))
+                # sincroniza SCHEDULE_HOUR también (opcional pero útil para coherencia)
+                db_set_flag("SCHEDULE_HOUR", str(h))
+                reconfigure_scheduler(context.application)
+                txt, kb = mk_sched_menu()
+                await safe_edit(query, txt, kb)
+            except Exception:
+                await query.edit_message_text(
+                    "Valor inválido para Start.", reply_markup=mk_sched_menu()[1]
+                )
+
+        elif data.startswith("act:sched:stop:"):
+            try:
+                h = int(data.split(":")[-1])
+                assert 0 <= h < 24
+                db_set_flag("SCHED_STOP", str(h))
+                reconfigure_scheduler(context.application)
+                txt, kb = mk_sched_menu()
+                await safe_edit(query, txt, kb)
+            except Exception:
+                await query.edit_message_text(
+                    "Valor inválido para Stop.", reply_markup=mk_sched_menu()[1]
+                )
+
         elif data.startswith("act:when:"):
             try:
                 hh = int(data.split(":")[2])
@@ -682,7 +837,7 @@ async def cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text("❌ Valor inválido", reply_markup=mk_when_menu())
         elif data == "act:back":
             txt, kb = refresh_menu_html()
-            await query.edit_message_text(txt, parse_mode=ParseMode.HTML, reply_markup=kb)
+            await safe_edit(query, txt, kb)
         else:
             await query.edit_message_text(
                 "🤔 Acción no reconocida.", reply_markup=mk_main_menu(is_paused())
@@ -697,27 +852,67 @@ async def cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_when(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text(f"Hora actual: {settings.SCHEDULE_HOUR:02d}:00")
+        cur = get_flag_int("SCHEDULE_HOUR", settings.SCHEDULE_HOUR)
+        await update.message.reply_text(f"Hora actual programada: {cur:02d}:00")
         return
     try:
         hh = int(context.args[0])
         assert 0 <= hh < 24
-        # Nota: persistencia de SCHEDULE_HOUR podría ir a kv si quieres hacerlo duradero
-        settings.SCHEDULE_HOUR = hh  # type: ignore[attr-defined]
-        await update.message.reply_text(f"✅ Nueva hora: {settings.SCHEDULE_HOUR:02d}:00")
+        db_set_flag("SCHEDULE_HOUR", str(hh))
+        # si no tienes ventana custom, sincroniza win_start con SCHEDULE_HOUR
+        db_set_flag("SCHED_START", str(hh))
+        reconfigure_scheduler(context.application)
+        await update.message.reply_text(f"✅ Nueva hora programada: {hh:02d}:00")
     except Exception:
         await update.message.reply_text("Formato: /when 2  (para 02:00)")
 
 
+def mk_sched_menu():
+    cfg = load_sched_config()
+    status = "Ventana" if cfg["enabled"] else "24/7"
+    row1 = [
+        InlineKeyboardButton("🟢 24/7 (sin programación)", callback_data="act:sched:always"),
+        InlineKeyboardButton("🕒 Ventana diaria", callback_data="act:sched:window"),
+    ]
+    # horas rápidas
+    hrs = [0, 3, 6, 12, 18, 21]
+    row2 = [
+        InlineKeyboardButton(f"Start {h:02d}", callback_data=f"act:sched:start:{h}") for h in hrs
+    ]
+    row3 = [
+        InlineKeyboardButton(f"Stop  {h:02d}", callback_data=f"act:sched:stop:{h}") for h in hrs
+    ]
+    rows = [row1, row2, row3]
+    return (
+        f"Modo actual: <b>{status}</b>\nStart: <b>{cfg['win_start']:02d}:00</b> — Stop: <b>{cfg['win_stop']:02d}:00</b>",
+        InlineKeyboardMarkup(rows),
+    )
+
+
+async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt, kb = mk_sched_menu()
+    await update.message.reply_text(txt, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+async def _safe_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    msg = getattr(update, "effective_message", None)
+    if msg:
+        await msg.reply_text(text)
+        return
+    chat_id = getattr(update, "effective_chat", None)
+    if chat_id:
+        try:
+            await context.application.bot.send_message(chat_id=chat_id.id, text=text)
+        except Exception:
+            pass
+
+
 async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # 1) flag en DB
     db_set_flag("PAUSED", "1")
-    # 2) pausar aria2
     try:
         aria2_pause_all()
     except Exception as e:
         print(f"[DBG] aria2_pause_all: {e!r}")
-    # 3) disparar evento de pausa (yt-dlp) + terminar subproceso si está vivo
     PAUSE_EVT.set()
     proc = RUNNING.get("ytdlp_proc")
     if proc and proc.returncode is None:
@@ -725,8 +920,8 @@ async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
             proc.terminate()
         except Exception:
             pass
-    await update.message.reply_text(
-        "⏸️ Pausado. La tarea activa será detenida y el resto quedado en 'paused'."
+    await _safe_reply(
+        update, context, "⏸️ Pausado. La tarea activa será detenida y el resto quedado en 'paused'."
     )
 
 
@@ -742,8 +937,6 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # leer ext_id y kind
     try:
-        from tgdl.core.db import _connect
-
         with _connect() as conn:
             cur = conn.execute("SELECT ext_id, kind FROM queue WHERE id=?", (qid,))
             row = cur.fetchone()
@@ -788,15 +981,16 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db_set_flag("PAUSED", "0")
     db_requeue_paused_reschedule_now()
-    # reanudar aria2
     try:
         aria2_unpause_all()
     except Exception as e:
         print(f"[DBG] aria2_unpause_all: {e!r}")
     PAUSE_EVT.clear()
-    await update.message.reply_text("▶️ Reanudado. Lanzando ciclo en segundo plano…")
+    await _safe_reply(update, context, "▶️ Reanudado. Lanzando ciclo en segundo plano…")
     await launch_cycle_background(
-        context.application, force_all=True, notify_chat_id=update.effective_chat.id
+        context.application,
+        force_all=True,
+        notify_chat_id=update.effective_chat.id if update.effective_chat else None,
     )
 
 
@@ -935,6 +1129,26 @@ async def intake(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         print(f"[DBG] forward_origin error: {e!r}")
 
+    # Si no hay programación (24/7): programar "ya" y lanzar ciclo
+    try:
+        if db_get_flag("SCHED_ENABLED", "1") == "0":
+            # Reprograma los recién encolados a "now"
+            from tgdl.core.db import _connect
+
+            now_iso = now.strftime("%Y-%m-%d %H:%M:%S")
+            with _connect() as conn:
+                conn.execute(
+                    "UPDATE queue SET scheduled_at=? WHERE status='queued' AND scheduled_at>?",
+                    (now_iso, now_iso),
+                )
+                conn.commit()
+            # dispara ciclo en segundo plano, con notificaciones al chat
+            await launch_cycle_background(
+                context.application, force_all=True, notify_chat_id=update.effective_chat.id
+            )
+    except Exception as e:
+        print(f"[DBG] intake 24/7 error: {e!r}")
+
     await m.reply_text(
         f"🗂️ Encolado para {scheduled_at.strftime('%Y-%m-%d %H:%M')} ({settings.TIMEZONE})."
     )
@@ -951,8 +1165,6 @@ def start_control_server():
         # Cancelación cooperativa:
         # 1) si es aria2 y tiene GID -> remove
         try:
-            from tgdl.core.db import _connect
-
             with _connect() as conn:
                 cur = conn.execute("SELECT ext_id, kind FROM queue WHERE id=?", (qid,))
                 row = cur.fetchone()
@@ -1031,6 +1243,8 @@ def start_control_server():
 
 
 async def main():
+    global SCHEDULER  # <-- IMPORTANTE
+
     # DB y carpeta
     db_init()
     Path(settings.DOWNLOAD_DIR).mkdir(parents=True, exist_ok=True)
@@ -1069,16 +1283,17 @@ async def main():
     app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(CallbackQueryHandler(cb_router))
     app.add_error_handler(on_error)
+    app.add_handler(CommandHandler("schedule", cmd_schedule))
 
     # Programa diario (hora configurable)
-    from apscheduler.schedulers.asyncio import AsyncIOScheduler
     from apscheduler.triggers.cron import CronTrigger
 
+    # Scheduler
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
     scheduler = AsyncIOScheduler(timezone=TZ)
-    scheduler.add_job(run_cycle, CronTrigger(hour=settings.SCHEDULE_HOUR, minute=0), args=[app])
-    # Pausa automática opcional (mismo comportamiento que tu versión previa)
-    scheduler.add_job(lambda: db_set_flag("PAUSED", "1"), CronTrigger(hour=6, minute=30))
     scheduler.start()
+    SCHEDULER = scheduler  # <-- ahora sí afecta a la global
 
     # Guardar contexto global para el HTTP control
     BOT.app = app
@@ -1087,6 +1302,9 @@ async def main():
 
     start_control_server()
 
+    # Reconfigurar una vez que SCHEDULER YA existe
+    reconfigure_scheduler(app)
+
     print(
         f"[i] Bot listo. Descarga diaria a las {settings.SCHEDULE_HOUR:02d}:00 ({settings.TIMEZONE})."
     )
@@ -1094,6 +1312,10 @@ async def main():
     # Inicio explícito del bot (modo polling)
     await app.initialize()
     await app.start()
+    try:
+        settings.SCHEDULE_HOUR = get_flag_int("SCHEDULE_HOUR", settings.SCHEDULE_HOUR)  # type: ignore[attr-defined]
+    except Exception:
+        pass
     await app.updater.start_polling()
     try:
         await asyncio.Future()

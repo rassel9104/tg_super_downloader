@@ -1,68 +1,68 @@
 from __future__ import annotations
+
 import asyncio
 import json
+import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
-
 from urllib.parse import urlparse
-
-from telegram.error import BadRequest
-
 from zoneinfo import ZoneInfo
-from fastapi import FastAPI
+
 import uvicorn
-
-from tgdl.adapters.downloaders.aria2 import tell_status as aria2_tell
-
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from fastapi import FastAPI
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import (
     ApplicationBuilder,
-    ContextTypes,
+    CallbackQueryHandler,
     CommandHandler,
+    ContextTypes,
     MessageHandler,
     filters,
-    CallbackQueryHandler,
 )
-import logging
-from telegram.constants import ParseMode
-
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
-from tgdl.config.settings import settings
-from tgdl.core.db import (
-    db_init,
-    db_set_flag,
-    db_get_flag,
-    is_paused,
-    db_add,
-    db_get_due,
-    db_get_all_queued,
-    db_update_status,
-    db_list,
-    db_purge_finished,
-    db_retry_errors,
-    db_requeue_paused_reschedule_now,
-    db_update_progress,
-    db_clear_progress,
-    db_clear_all,  # <- NUEVO
-    db_get_progress_rows,  # <— NUEVO (para notificaciones)
-    db_set_ext_id,
-    _connect,
+from tgdl.adapters.downloaders import ytdlp
+from tgdl.adapters.downloaders.aria2 import (
+    add_uri as aria2_add,
 )
-
-from tgdl.adapters.downloaders.aria2 import remove as aria2_remove
-
 from tgdl.adapters.downloaders.aria2 import (
     aria2_enabled,
-    add_uri as aria2_add,
+)
+from tgdl.adapters.downloaders.aria2 import (
     pause_all as aria2_pause_all,
+)
+from tgdl.adapters.downloaders.aria2 import remove as aria2_remove
+from tgdl.adapters.downloaders.aria2 import tell_status as aria2_tell
+from tgdl.adapters.downloaders.aria2 import (
     unpause_all as aria2_unpause_all,
 )
-from tgdl.adapters.downloaders import ytdlp
+from tgdl.config.settings import settings
+from tgdl.core.db import (
+    _connect,
+    db_add,
+    db_clear_all,  # <- NUEVO
+    db_clear_progress,
+    db_get_all_queued,
+    db_get_due,
+    db_get_flag,
+    db_get_progress_rows,  # <— NUEVO (para notificaciones)
+    db_init,
+    db_list,
+    db_purge_finished,
+    db_requeue_paused_reschedule_now,
+    db_retry_errors,
+    db_set_ext_id,
+    db_set_flag,
+    db_update_progress,
+    db_update_status,
+    is_paused,
+)
 
 # ========= Estado/Flags globales =========
 PAUSE_EVT: asyncio.Event = asyncio.Event()
@@ -73,6 +73,7 @@ RUNNING: dict[str, any] = {"ytdlp_proc": None}  # guardamos el subproceso activo
 TZ = ZoneInfo(settings.TIMEZONE)
 URL_RE = re.compile(r"(https?://\S+|magnet:\?xt=urn:btih:[A-Za-z0-9]+[^ \n]*)", re.IGNORECASE)
 TG_LINK_RE = re.compile(r"https?://t\.me/(c/)?([^/]+)/(\d+)", re.IGNORECASE)
+LINK_RE = re.compile(r"(?i)\b((?:magnet:\?xt=urn:[a-z0-9:]+)|(?:https?://[^\s]+))")
 
 MAX_WORKERS = 2
 WORK_SEM = asyncio.Semaphore(MAX_WORKERS)
@@ -429,7 +430,7 @@ async def run_cycle(app, force_all: bool = False, notify_chat_id: int | None = N
     outdir_base = Path(settings.DOWNLOAD_DIR)
 
     if is_paused():
-        print(f"[DBG] Ciclo omitido: PAUSADO")
+        print("[DBG] Ciclo omitido: PAUSADO")
         return
     # limpiar/asegurar estado de pausa
     PAUSE_EVT.clear()
@@ -469,7 +470,9 @@ async def run_cycle(app, force_all: bool = False, notify_chat_id: int | None = N
                             ok = False
                         elif low.endswith(".torrent"):
                             # Descarga el .torrent a temp y envíalo a aria2
-                            import requests, tempfile
+                            import tempfile
+
+                            import requests
 
                             with tempfile.NamedTemporaryFile(delete=False, suffix=".torrent") as tf:
                                 r = requests.get(url, timeout=30)
@@ -1085,21 +1088,32 @@ async def on_error(update: object, context):
 async def intake(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.message
     now = datetime.now(tz=TZ)
+
     scheduled_at = now.replace(hour=settings.SCHEDULE_HOUR, minute=0, second=0, microsecond=0)
     if scheduled_at <= now:
         scheduled_at += timedelta(days=1)
 
     text = (m.text or m.caption or "") if m else ""
 
+    # Contadores para UX
+    c_tg_urls = 0
+    c_web_urls = 0
+    c_media = 0
+    enqueued_any = False
+
     # 1) Enlaces de mensajes de Telegram
     tg_urls = re.findall(r"https?://t\.me/[^\s]+", text, flags=re.IGNORECASE)
     for u in tg_urls:
         db_add("tg_link", {"url": u}, scheduled_at)
+        c_tg_urls += 1
+        enqueued_any = True
 
     # 2) URLs/magnets (excluye t.me)
     urls = [u for u in extract_urls(text) if not u.lower().startswith("https://t.me/")]
     for u in urls:
         db_add("url", {"url": u}, scheduled_at)
+        c_web_urls += 1
+        enqueued_any = True
 
     # 3) Media reenviada al bot -> self_ref
     suggested = None
@@ -1112,12 +1126,14 @@ async def intake(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif m and m.photo:
         suggested = "photo.jpg"
 
-    if m and (m.document or m.video or m.audio or m.photo):
+    if m and (m.document or m.video or m.audio or m.photo or m.voice or m.video_note):
         db_add(
             "self_ref",
             {"chat_id": m.chat_id, "message_id": m.message_id, "suggested_name": suggested},
             scheduled_at,
         )
+        c_media += 1
+        enqueued_any = True
 
     # 4) Origen reenviado (si el canal permite revelar origen) -> tg_ref
     try:
@@ -1126,13 +1142,26 @@ async def intake(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id = fo.chat.id
             mid = fo.message_id
             db_add("tg_ref", {"chat_id": chat_id, "message_id": mid}, scheduled_at)
+            enqueued_any = True
     except Exception as e:
         print(f"[DBG] forward_origin error: {e!r}")
 
-    # Si no hay programación (24/7): programar "ya" y lanzar ciclo
+    # 5) Si no hay insumos accionables → NO encolar y NO disparar ciclo.
+    if not enqueued_any:
+        await m.reply_text(
+            "👋 Te leo. Envíame un **enlace http/https**, un **magnet** o reenvía el **archivo**.\n"
+            "Ejemplos:\n"
+            "• https://ejemplo.com/video.mp4\n"
+            "• magnet:?xt=urn:btih:...\n"
+            "• Reenvía un mensaje con el archivo o video\n"
+            "Usa /help si necesitas más detalles o\n"
+            "Usa /Menu para opciones rapidas."
+        )
+        return
+
+    # 6) Si no hay programación (24/7): solo reprograma si encolaste algo
     try:
         if db_get_flag("SCHED_ENABLED", "1") == "0":
-            # Reprograma los recién encolados a "now"
             from tgdl.core.db import _connect
 
             now_iso = now.strftime("%Y-%m-%d %H:%M:%S")
@@ -1142,15 +1171,25 @@ async def intake(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     (now_iso, now_iso),
                 )
                 conn.commit()
-            # dispara ciclo en segundo plano, con notificaciones al chat
             await launch_cycle_background(
                 context.application, force_all=True, notify_chat_id=update.effective_chat.id
             )
     except Exception as e:
         print(f"[DBG] intake 24/7 error: {e!r}")
 
+    # 7) Respuesta amigable con desglose
+    parts = []
+    if c_tg_urls:
+        parts.append(f"{c_tg_urls} enlace(s) de Telegram")
+    if c_web_urls:
+        parts.append(f"{c_web_urls} URL/magnet(s)")
+    if c_media:
+        parts.append(f"{c_media} medio(s) reenviado(s)")
+    summary = " + ".join(parts) if parts else "tarea(s)"
+
     await m.reply_text(
-        f"🗂️ Encolado para {scheduled_at.strftime('%Y-%m-%d %H:%M')} ({settings.TIMEZONE})."
+        f"✅ {summary} encolado(s) para "
+        f"{scheduled_at.strftime('%Y-%m-%d %H:%M')} ({settings.TIMEZONE})."
     )
 
 
@@ -1286,7 +1325,6 @@ async def main():
     app.add_handler(CommandHandler("schedule", cmd_schedule))
 
     # Programa diario (hora configurable)
-    from apscheduler.triggers.cron import CronTrigger
 
     # Scheduler
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -1309,7 +1347,7 @@ async def main():
         f"[i] Bot listo. Descarga diaria a las {settings.SCHEDULE_HOUR:02d}:00 ({settings.TIMEZONE})."
     )
 
-    # Inicio explícito del bot (modo polling)
+    # Inicio explícito del bot de telegram
     await app.initialize()
     await app.start()
     try:

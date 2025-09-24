@@ -29,3 +29,8 @@ htmlcov/
 
 # Tools
 tools/
+
+# TGDL logs
+logs/
+*.log
+

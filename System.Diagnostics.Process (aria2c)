@@ -1,0 +1,9 @@
+Specify at least one URL.
+Usage: aria2c [OPTIONS] [URI | MAGNET | TORRENT_FILE | METALINK_FILE]...
+See 'aria2c -h'.
+Specify at least one URL.
+Usage: aria2c [OPTIONS] [URI | MAGNET | TORRENT_FILE | METALINK_FILE]...
+See 'aria2c -h'.
+Specify at least one URL.
+See 'aria2c -h'.
+Usage: aria2c [OPTIONS] [URI | MAGNET | TORRENT_FILE | METALINK_FILE]...

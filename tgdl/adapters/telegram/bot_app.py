@@ -1250,7 +1250,18 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not p:
                     continue
                 try:
-                    Path(p).unlink(missing_ok=True)
+                    path = Path(p)
+                    # borrar archivo parcial si existe
+                    path.unlink(missing_ok=True)
+                    # borrar sidecars comunes: .aria2 y fragmentos *.part/*.ytdl del mismo directorio
+                    sidecar = Path(str(path) + ".aria2")
+                    sidecar.unlink(missing_ok=True)
+                    try:
+                        for cand in path.parent.glob(path.name + ".*"):
+                            if cand.suffix.lower() in (".part", ".ytdl"):
+                                cand.unlink(missing_ok=True)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
         except Exception as e:

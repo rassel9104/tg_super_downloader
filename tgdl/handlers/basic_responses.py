@@ -111,17 +111,23 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         kind = (
             "archivo"
             if msg.document
-            else "foto"
-            if msg.photo
-            else "video"
-            if msg.video
-            else "audio"
-            if msg.audio
-            else "nota de voz"
-            if msg.voice
-            else "video corto"
-            if msg.video_note
-            else "sticker"
+            else (
+                "foto"
+                if msg.photo
+                else (
+                    "video"
+                    if msg.video
+                    else (
+                        "audio"
+                        if msg.audio
+                        else (
+                            "nota de voz"
+                            if msg.voice
+                            else "video corto" if msg.video_note else "sticker"
+                        )
+                    )
+                )
+            )
         )
         reply = f"📥 He recibido tu **{kind}**.\nLo pasaré por el **módulo de descargas**."
         await msg.reply_text(reply)

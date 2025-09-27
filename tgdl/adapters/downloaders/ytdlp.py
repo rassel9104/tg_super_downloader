@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from tgdl.core.logging import logger
+
 # Ajusta si tu settings vive en otra ruta
 try:
     from tgdl.config.settings import settings
@@ -214,7 +216,7 @@ async def probe_playlist(url: str, limit: int = 10) -> dict[str, Any]:
         "%(playlist_index)s|%(id)s|%(title)s",
         url,
     ]
-    print(f"[YTDLP][probe] launching: {yt} --flat-playlist --print ...")
+    logger.info("[YTDLP][probe] launching flat-playlist")
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -250,10 +252,10 @@ async def probe_playlist(url: str, limit: int = 10) -> dict[str, Any]:
             if title is None:
                 title = s
 
-        print(f"[YTDLP][probe] title={title!r} count={count} sample={len(sample)}")
+        logger.info("[YTDLP][probe] title=%r count=%s sample=%d", title, count, len(sample))
         return {"title": title, "count": count, "sample": sample[:limit]}
     except Exception as e:
-        print(f"[YTDLP][probe][ERR] {e!r}")
+        logger.error("[YTDLP][probe][ERR] %r", e)
         return {"title": None, "count": None, "sample": []}
 
 
@@ -269,8 +271,8 @@ async def download_proc(
     progress_cb: Callable[[dict[str, Any]], None] | None = None,
     max_items: int | None = None,
 ) -> bool:
-    print(
-        f"[YTDLP][guard] url_has_playlistish={_url_has_playlistish(url)} | allow_playlist={allow_playlist}"
+    logger.info(
+        "[YTDLP][guard] playlistish=%s allow_playlist=%s", _url_has_playlistish(url), allow_playlist
     )
 
     # Normaliza tope y batch
@@ -307,7 +309,13 @@ async def download_proc(
         ]
 
         outdir.mkdir(parents=True, exist_ok=True)
-        print(f"[YTDLP][exec] {yt} -o {outtmpl} ... (dir={outdir}) [cookies={use_cookies}]")
+        logger.info(
+            "[YTDLP][exec] bin=%s outtmpl=%s dir=%s cookies=%s",
+            yt,
+            outtmpl,
+            str(outdir),
+            use_cookies,
+        )
 
         proc = await asyncio.create_subprocess_exec(
             *args,
@@ -350,12 +358,12 @@ async def download_proc(
                 m_start = re_item_start.search(ln)
                 if m_start:
                     items_started += 1
-                    print(f"[YTDLP][item] start #{items_started}: {m_start.group(1)}")
+                    logger.debug("[YTDLP][item] start #%d: %s", items_started, m_start.group(1))
 
                 # MARCAMOS "hecho" por cualquiera de estas señales:
                 if re_item_done.search(ln) or re_item_skip.search(ln) or re_merging.search(ln):
                     items_done += 1
-                    print(f"[YTDLP][item] done  #{items_done}")
+                    logger.debug("[YTDLP][item] done  #%d", items_done)
                     # Telegram: batched (cada N)
                     if (
                         progress_cb
@@ -390,19 +398,19 @@ async def download_proc(
             ok = rc == 0 or rc == 101
             if not ok:
                 tail = lines[-40:] if len(lines) > 40 else lines
-                print(f"[YTDLP][done] rc={rc} | lines={len(lines)} | tail:\n" + "\n".join(tail))
-            else:
-                print(
-                    f"[YTDLP][done] rc={rc} | lines={len(lines)} | started={items_started} done={items_done}"
+                logger.error(
+                    "[YTDLP][done] rc=%s lines=%d tail=%s", rc, len(lines), "\n".join(tail)
                 )
+            else:
+                logger.info("[YTDLP][done] rc=%s started=%d done=%d", rc, items_started, items_done)
             return ok, lines
         except TimeoutError:
-            print(f"[YTDLP][TOUT] killing process after {max_secs}s")
+            logger.error("[YTDLP][TOUT] killing process after %ss", max_secs)
             with contextlib.suppress(Exception):
                 proc.kill()
             return False, lines
         except Exception as e:
-            print(f"[YTDLP][ERR] {e!r}")
+            logger.error("[YTDLP][ERR] %r", e)
             with contextlib.suppress(Exception):
                 proc.kill()
             return False, lines
@@ -414,9 +422,9 @@ async def download_proc(
 
     # 2º intento sin cookies (fallback genérico)
     if _looks_403(lines):
-        print("[YTDLP][retry] 403 detectado; reintentando SIN cookies…")
+        logger.warning("[YTDLP][retry] 403 detectado; reintentando SIN cookies…")
     else:
-        print("[YTDLP][retry] rc!=0; reintentando SIN cookies como fallback…")
+        logger.warning("[YTDLP][retry] rc!=0; reintentando SIN cookies como fallback…")
     ok2, lines2 = await _run(use_cookies=False)
     if ok2:
         return True
@@ -424,5 +432,5 @@ async def download_proc(
     # Tail final si también falla sin cookies
     tail = lines2 or lines
     tail = tail[-40:] if len(tail) > 40 else tail
-    print("[YTDLP][fail] sin cookies también falló. Tail:\n" + "\n".join(tail))
+    logger.error("[YTDLP][fail] sin cookies también falló. Tail=%s", "\n".join(tail))
     return False

@@ -8,6 +8,8 @@ from typing import Any
 import requests
 
 from tgdl.config.settings import settings
+from tgdl.core.logging import logger
+from tgdl.utils.retry import retry
 
 
 class Aria2Client:
@@ -24,6 +26,7 @@ class Aria2Client:
         self._session.headers.update({"Content-Type": "application/json"})
 
     # ====== núcleo JSON-RPC ======
+    @retry("aria2-rpc", tries=4, base_delay=0.4, jitter=True)
     def _call(self, method: str, params: list[Any] | None = None) -> Any:
         payload = {"jsonrpc": "2.0", "id": "tgdl", "method": method}
         p = list(params) if params else []
@@ -35,7 +38,14 @@ class Aria2Client:
         resp.raise_for_status()
         data = resp.json()
         if data.get("error"):
-            raise RuntimeError(f"aria2 error: {data['error']}")
+            err = data["error"]
+            logger.error(
+                "aria2._call error method=%s code=%s message=%s",
+                method,
+                err.get("code"),
+                err.get("message"),
+            )
+            raise RuntimeError(f"aria2 error: {err}")
         return data.get("result")
 
     # ====== envoltorios más usados ======
@@ -116,12 +126,19 @@ def aria2_enabled() -> bool:
         ARIA2.get_version()
         return True
     except Exception:
+        logger.warning("aria2 not reachable at %s", ARIA2.endpoint)
         return False
 
 
-def add_uri(url: str, outdir: Path) -> str:
+def add_uri(url: str, outdir: Path, headers: dict[str, str] | None = None) -> str:
     """Añade una URL (http/https/magnet) y devuelve el GID."""
-    return ARIA2.add_uri([url], outdir=outdir, options=None)
+    opts: dict[str, Any] = {}
+    if headers:
+        # aria2 espera lista de strings "K: V"
+        hdr_list = [f"{k}: {v}" for k, v in headers.items() if k and v is not None]
+        if hdr_list:
+            opts["header"] = hdr_list
+    return ARIA2.add_uri([url], outdir=outdir, options=opts or None)
 
 
 def add_torrent(torrent_path: Path, outdir: Path) -> str:

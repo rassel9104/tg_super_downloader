@@ -37,3 +37,5 @@ tools/
 logs/
 *.log
 
+.pytest_tmp/
+.pytest_cache_local/

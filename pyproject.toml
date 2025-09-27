@@ -14,6 +14,7 @@ dependencies = [
   "pydantic-settings>=2.6.1",
   "fastapi>=0.115.0",
   "uvicorn[standard]>=0.30.6",
+  "httpx>=0.27,<0.28",
   "telethon>=1.36.0",
   "python-telegram-bot>=21.4",
   "APScheduler>=3.10.4",
@@ -21,9 +22,10 @@ dependencies = [
   "tenacity>=9.0.0",
   "prometheus-client>=0.21.0",
   "structlog>=24.4.0",
-  "yt-dlp>=2025.0.0",   # versión placeholder; se ajusta si hace falta
+  "yt-dlp>=2024.08.06,<2026",
   "typing-extensions>=4.12.2",
 ]
+
 
 [project.optional-dependencies]
 dev = [
@@ -34,6 +36,10 @@ dev = [
   "pytest-asyncio>=0.24.0",
   "alembic>=1.13.2"
 ]
+[tool.setuptools]
+[tool.setuptools.packages.find]
+include = ["tgdl*"]
+exclude = ["data*", "logs*", "downloads*", "tests*"]
 
 [tool.black]
 line-length = 100
@@ -43,7 +49,24 @@ target-version = ["py313"]
 line-length = 100
 target-version = "py313"
 lint.select = ["E","F","I","UP","B","SIM","ASYNC","RUF"]
-lint.ignore = ["E501"]
+lint.ignore = [
+  "E501",   # líneas largas
+  "I001",   # imports no ordenados
+  "UP006",  # usar list en vez de List
+  "UP007",  # usar X|Y en vez de Optional
+  "UP035",  # typing.Dict/List/Tuple deprecado
+  "SIM105", # try/except/pass -> suppress
+  "SIM102", # if anidados
+  "SIM103", # return directo
+  "ASYNC210", # requests en async
+  "RUF005", # concatenación en vez de unpacking
+  "RUF006", # create_task sin referencia
+  "RUF019", # dict.get en vez de if "key" in dict
+  "UP041",  # asyncio.TimeoutError en vez de TimeoutError
+  "RUF001", # caracteres unicode ambiguos
+  "B904",   # raise ... from e
+]
+
 
 [tool.mypy]
 python_version = "3.13"

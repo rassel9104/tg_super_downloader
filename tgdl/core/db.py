@@ -1,22 +1,24 @@
 from __future__ import annotations
+
 import json
 import sqlite3
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from tgdl.config.settings import settings
 
+
 # ---------- Helpers de conexión ----------
 def _connect(db_path: Path | None = None) -> sqlite3.Connection:
-    db_file = (db_path or settings.DB_PATH)
+    db_file = db_path or settings.DB_PATH
     db_file.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_file, isolation_level=None, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA foreign_keys=ON;")
     return conn
+
 
 # ---------- Esquema ----------
 SCHEMA_SQL = """
@@ -65,9 +67,11 @@ CREATE TABLE IF NOT EXISTS schedules (
 );
 """
 
+
 def db_init(db_path: Path | None = None) -> None:
     with _connect(db_path) as conn:
         conn.executescript(SCHEMA_SQL)
+
 
 # ---------- Flags ----------
 def db_set_flag(key: str, value: str) -> None:
@@ -77,18 +81,22 @@ def db_set_flag(key: str, value: str) -> None:
             (key, value),
         )
 
+
 def db_get_flag(key: str, default: str | None = None) -> str | None:
     with _connect() as conn:
         cur = conn.execute("SELECT v FROM kv WHERE k=?", (key,))
         row = cur.fetchone()
         return row[0] if row else default
 
+
 def is_paused() -> bool:
     return db_get_flag("PAUSED", "0") == "1"
+
 
 # ---------- Queue ----------
 def _iso_now() -> str:
     return datetime.now().astimezone().isoformat()
+
 
 def db_add(kind: str, payload: dict[str, Any], scheduled_at: datetime) -> int:
     now_iso = _iso_now()
@@ -100,6 +108,7 @@ def db_add(kind: str, payload: dict[str, Any], scheduled_at: datetime) -> int:
             (kind, json.dumps(payload, ensure_ascii=False), "queued", sched_iso, now_iso, now_iso),
         )
         return int(cur.lastrowid)
+
 
 def db_get_due(now: datetime) -> list[tuple[int, str, str]]:
     """Elementos en 'queued' programados hasta 'now' (incl)."""
@@ -113,12 +122,14 @@ def db_get_due(now: datetime) -> list[tuple[int, str, str]]:
         )
         return list(cur.fetchall())
 
+
 def db_get_all_queued() -> list[tuple[int, str, str]]:
     with _connect() as conn:
         cur = conn.execute(
             "SELECT id, kind, payload FROM queue WHERE status='queued' ORDER BY id ASC"
         )
         return list(cur.fetchall())
+
 
 def db_update_status(qid: int, status: str) -> None:
     with _connect() as conn:
@@ -127,19 +138,21 @@ def db_update_status(qid: int, status: str) -> None:
             (status, _iso_now(), qid),
         )
 
+
 def db_list(limit: int = 50) -> list[tuple[int, str, str, str, str]]:
     with _connect() as conn:
         cur = conn.execute(
-            "SELECT id, kind, payload, status, scheduled_at "
-            "FROM queue ORDER BY id DESC LIMIT ?",
+            "SELECT id, kind, payload, status, scheduled_at FROM queue ORDER BY id DESC LIMIT ?",
             (int(limit),),
         )
         return list(cur.fetchall())
+
 
 def db_purge_finished() -> int:
     with _connect() as conn:
         cur = conn.execute("DELETE FROM queue WHERE status IN ('done','error')")
         return cur.rowcount
+
 
 def db_retry_errors() -> int:
     with _connect() as conn:
@@ -149,6 +162,7 @@ def db_retry_errors() -> int:
         )
         return cur.rowcount
 
+
 def db_requeue_paused() -> int:
     with _connect() as conn:
         cur = conn.execute(
@@ -156,6 +170,7 @@ def db_requeue_paused() -> int:
             (_iso_now(),),
         )
         return cur.rowcount
+
 
 def db_requeue_paused_reschedule_now() -> int:
     now_iso = _iso_now()
@@ -165,6 +180,7 @@ def db_requeue_paused_reschedule_now() -> int:
             (now_iso, now_iso),
         )
         return cur.rowcount
+
 
 # ---------- Progreso ----------
 def db_update_progress(qid: int, total: int | None, downloaded: int) -> None:
@@ -176,9 +192,11 @@ def db_update_progress(qid: int, total: int | None, downloaded: int) -> None:
             (qid, total if (total or 0) > 0 else None, downloaded, _iso_now()),
         )
 
+
 def db_clear_progress(qid: int) -> None:
     with _connect() as conn:
         conn.execute("DELETE FROM progress WHERE qid=?", (qid,))
+
 
 # ---------- Eventos (opcional, para auditoría y panel) ----------
 def db_add_event(qid: int | None, etype: str, payload: dict[str, Any]) -> int:
@@ -189,6 +207,7 @@ def db_add_event(qid: int | None, etype: str, payload: dict[str, Any]) -> int:
         )
         return int(cur.lastrowid)
 
+
 # ---------- Migraciones y utilidades varias ----------
 def db_migrate_add_ext_id() -> None:
     """Asegura que queue tenga columna ext_id (para GID de aria2 u otros ids externos)."""
@@ -198,19 +217,34 @@ def db_migrate_add_ext_id() -> None:
         if "ext_id" not in cols:
             conn.execute("ALTER TABLE queue ADD COLUMN ext_id TEXT")
 
+
 def db_set_ext_id(qid: int, ext_id: str | None) -> None:
     with _connect() as conn:
-        conn.execute("UPDATE queue SET ext_id=?, updated_at=? WHERE id=?", (ext_id, _iso_now(), qid))
+        conn.execute(
+            "UPDATE queue SET ext_id=?, updated_at=? WHERE id=?", (ext_id, _iso_now(), qid)
+        )
+
 
 def db_get_queue(limit: int = 200):
     with _connect() as conn:
-        cur = conn.execute("SELECT id, kind, payload, status, scheduled_at, ext_id FROM queue ORDER BY id DESC LIMIT ?", (int(limit),))
+        cur = conn.execute(
+            "SELECT id, kind, payload, status, scheduled_at, ext_id FROM queue ORDER BY id DESC LIMIT ?",
+            (int(limit),),
+        )
         return list(cur.fetchall())
+
 
 def db_get_progress_rows(limit: int = 100):
     with _connect() as conn:
-        cur = conn.execute("SELECT qid,total,downloaded,updated_at FROM progress ORDER BY updated_at DESC LIMIT ?", (int(limit),))
-        return [{"qid":r[0],"total":r[1],"downloaded":r[2],"updated_at":r[3]} for r in cur.fetchall()]
+        cur = conn.execute(
+            "SELECT qid,total,downloaded,updated_at FROM progress ORDER BY updated_at DESC LIMIT ?",
+            (int(limit),),
+        )
+        return [
+            {"qid": r[0], "total": r[1], "downloaded": r[2], "updated_at": r[3]}
+            for r in cur.fetchall()
+        ]
+
 
 def db_clear_all() -> None:
     with _connect() as conn:
@@ -218,6 +252,3 @@ def db_clear_all() -> None:
         conn.execute("DELETE FROM queue")
         # opcional: limpiar flags, descomentando si lo deseas
         # conn.execute("DELETE FROM kv WHERE k IN ('PAUSED')")
-
-
-

@@ -1,6 +1,8 @@
 import time
 from pathlib import Path
-from tgdl.adapters.downloaders.aria2 import aria2_enabled, add_uri, tell_status
+
+from tgdl.adapters.downloaders.aria2 import add_uri, aria2_enabled, tell_status
+
 
 def test_rpc_add_uri():
     assert aria2_enabled()

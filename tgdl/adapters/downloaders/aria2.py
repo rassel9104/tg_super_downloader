@@ -1,92 +1,145 @@
 from __future__ import annotations
-import json
+
 import base64
+import json
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
+
 import requests
 
 from tgdl.config.settings import settings
 
-_JSONRPC = "2.0"
-_TIMEOUT = 15
 
-def _rpc(method: str, params: list[Any] | None = None) -> Any:
-    url = settings.ARIA2_ENDPOINT
-    headers = {"Content-Type": "application/json"}
-    p = []
-    if settings.ARIA2_SECRET:
-        p.append(f"token:{settings.ARIA2_SECRET}")
-    if params:
-        p.extend(params)
-    body = {"jsonrpc": _JSONRPC, "method": method, "id": "tgdl", "params": p}
-    r = requests.post(url, headers=headers, data=json.dumps(body), timeout=_TIMEOUT)
-    r.raise_for_status()
-    j = r.json()
-    if "error" in j:
-        raise RuntimeError(j["error"])
-    return j.get("result")
+class Aria2Client:
+    """
+    Cliente mínimo para aria2 JSON-RPC con helpers de alto nivel.
+    Respeta ARIA2_ENDPOINT y ARIA2_SECRET de .env
+    """
+
+    def __init__(self, endpoint: str | None = None, secret: str | None = None, timeout: int = 10):
+        self.endpoint = (endpoint or settings.ARIA2_ENDPOINT).rstrip("/")
+        self.secret = secret or settings.ARIA2_SECRET
+        self.timeout = timeout
+        self._session = requests.Session()
+        self._session.headers.update({"Content-Type": "application/json"})
+
+    # ====== núcleo JSON-RPC ======
+    def _call(self, method: str, params: list[Any] | None = None) -> Any:
+        payload = {"jsonrpc": "2.0", "id": "tgdl", "method": method}
+        p = list(params) if params else []
+        if self.secret:
+            p = [f"token:{self.secret}", *p]
+        payload["params"] = p
+
+        resp = self._session.post(self.endpoint, data=json.dumps(payload), timeout=self.timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("error"):
+            raise RuntimeError(f"aria2 error: {data['error']}")
+        return data.get("result")
+
+    # ====== envoltorios más usados ======
+    def get_version(self) -> dict:
+        return self._call("aria2.getVersion", [])
+
+    def tell_active(self) -> Any:
+        return self._call("aria2.tellActive", [])
+
+    def tell_status(self, gid: str) -> dict:
+        # Campos habituales para limpieza/estado
+        keys = ["status", "totalLength", "completedLength", "files", "errorCode", "errorMessage"]
+        return self._call("aria2.tellStatus", [gid, keys])
+
+    def pause_all(self) -> Any:
+        return self._call("aria2.pauseAll", [])
+
+    def unpause_all(self) -> Any:
+        return self._call("aria2.unpauseAll", [])
+
+    def remove(self, gid: str) -> Any:
+        try:
+            return self._call("aria2.remove", [gid])
+        finally:
+            # Intenta limpiar también resultados en estado "removed/error"
+            try:
+                self._call("aria2.removeDownloadResult", [gid])
+            except Exception:
+                pass
+
+    def add_uri(
+        self, uris: list[str], *, outdir: Path | None = None, options: dict | None = None
+    ) -> str:
+        opts = dict(options or {})
+        if outdir:
+            Path(outdir).mkdir(parents=True, exist_ok=True)
+            opts["dir"] = str(outdir)
+        params = [uris]
+        if opts:
+            params.append(opts)
+        gid = self._call("aria2.addUri", params)
+        return gid
+
+    def add_torrent(
+        self, torrent_path: Path, *, outdir: Path | None = None, options: dict | None = None
+    ) -> str:
+        """
+        Sube un .torrent a aria2 usando aria2.addTorrent:
+        params = [torrentContent(base64), uris(list) opcional, options dict]
+        """
+        torrent_path = Path(torrent_path)
+        if not torrent_path.exists():
+            raise FileNotFoundError(f"No existe el torrent: {torrent_path}")
+
+        with open(torrent_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("ascii")
+
+        opts = dict(options or {})
+        if outdir:
+            Path(outdir).mkdir(parents=True, exist_ok=True)
+            opts["dir"] = str(outdir)
+
+        params = [b64, [], opts]  # sin URIs adicionales
+        gid = self._call("aria2.addTorrent", params)
+        return gid
+
+
+# Singleton compartido
+ARIA2 = Aria2Client()
+
+
+# ====== API de módulo que espera bot_app.py ======
+
 
 def aria2_enabled() -> bool:
+    """Devuelve True si el endpoint responde a getVersion()."""
     try:
-        _rpc("aria2.getVersion")
+        ARIA2.get_version()
         return True
     except Exception:
         return False
 
-def add_uri(url: str, outdir: Path, outname: str | None = None) -> str:
-    outdir = Path(outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
-    opts: Dict[str, Any] = {
-        "dir": str(outdir),
-        "continue": "true",
-        "max-connection-per-server": "16",
-        "split": "16",
-        "timeout": "60",
-        "check-certificate": "false",
-        "auto-file-renaming": "false",
-    }
-    if outname:
-        opts["out"] = outname
-    # params = [[URLS], options]
-    return _rpc("aria2.addUri", [[url], opts])
 
-def tell_status(gid: str) -> dict[str, Any]:
-    return _rpc("aria2.tellStatus", [gid, ["status", "totalLength", "completedLength", "downloadSpeed", "errorMessage", "files"]])
+def add_uri(url: str, outdir: Path) -> str:
+    """Añade una URL (http/https/magnet) y devuelve el GID."""
+    return ARIA2.add_uri([url], outdir=outdir, options=None)
 
-def pause(gid: str) -> Any:
-    return _rpc("aria2.pause", [gid])
 
-def unpause(gid: str) -> Any:
-    return _rpc("aria2.unpause", [gid])
+def add_torrent(torrent_path: Path, outdir: Path) -> str:
+    """Añade un archivo .torrent y devuelve el GID."""
+    return ARIA2.add_torrent(torrent_path, outdir=outdir, options=None)
 
-def remove(gid: str) -> Any:
-    return _rpc("aria2.remove", [gid])
 
 def pause_all() -> Any:
-    return _rpc("aria2.pauseAll")
+    return ARIA2.pause_all()
+
 
 def unpause_all() -> Any:
-    return _rpc("aria2.unpauseAll")
+    return ARIA2.unpause_all()
 
-def get_global_stat() -> dict[str, Any]:
-    return _rpc("aria2.getGlobalStat")
 
-def add_torrent(torrent_path: Path, outdir: Path, outname: str | None = None) -> str:
-    """
-    Envía un .torrent a aria2 como binario base64 (RPC aria2.addTorrent).
-    Devuelve GID.
-    """
-    outdir = Path(outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
-    data = Path(torrent_path).read_bytes()
-    torrent_b64 = base64.b64encode(data).decode("ascii")
-    opts: Dict[str, Any] = {
-        "dir": str(outdir),
-        "continue": "true",
-        "auto-file-renaming": "false",
-        "check-certificate": "false",
-    }
-    if outname:
-        opts["out"] = outname
-    # params = [torrent(base64), uris (opcional), options]
-    return _rpc("aria2.addTorrent", [torrent_b64, [], opts])
+def remove(gid: str) -> Any:
+    return ARIA2.remove(gid)
+
+
+def tell_status(gid: str) -> dict:
+    return ARIA2.tell_status(gid)

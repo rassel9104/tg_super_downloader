@@ -9,6 +9,9 @@ __pycache__/
 .venv/
 .env
 *.log
+*.session
+*.session-journal
+.session
 
 # VSCode
 .vscode/

@@ -1,6 +1,7 @@
+LICENSE
 README.md
 pyproject.toml
-tests/test_smoke.py
+tests/test_resolvers_mediafire.py
 tg_super_downloader.egg-info/PKG-INFO
 tg_super_downloader.egg-info/SOURCES.txt
 tg_super_downloader.egg-info/dependency_links.txt
@@ -15,6 +16,9 @@ tgdl/config/settings.py
 tgdl/core/db.py
 tgdl/core/events.py
 tgdl/core/state.py
+tgdl/handlers/basic_responses.py
 tgdl/panel/api.py
 tgdl/schemas/models.py
 tgdl/utils/paths.py
+tgdl/utils/resolvers.py
+tgdl/utils/retry.py

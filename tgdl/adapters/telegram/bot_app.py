@@ -1634,9 +1634,11 @@ async def main():
 
             await tclient.connect()
             if not await tclient.is_user_authorized():
-                raise SystemExit(
-                    "La sesión de Telethon no está autorizada. Ejecuta session_setup.py de nuevo (o usa modo file)."
-                )
+                # Login guiado (solo file-mode)
+                phone = os.getenv("TELETHON_PHONE") or input("Teléfono (+1...): ").strip()
+                await tclient.start(phone=phone)
+                if not await tclient.is_user_authorized():
+                    raise SystemExit("No fue posible autorizar la sesión (verifica código/2FA).")
 
         except AuthKeyDuplicatedError:
             # Mensaje claro y salida controlada

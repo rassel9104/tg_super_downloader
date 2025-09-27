@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
+import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
 import uvicorn
@@ -63,6 +65,29 @@ from tgdl.core.db import (
     db_update_status,
     is_paused,
 )
+
+try:
+    from tgdl.config.settings import settings  # si ya existe en tu proyecto
+except Exception:
+    settings = None
+
+
+def _get_playlist_limit(default: int = 24) -> int:
+    try:
+        if settings is not None:
+            v = getattr(settings, "YTDLP_MAX_PLAYLIST_ITEMS", None)
+            if v is not None and str(v).strip():
+                return int(v)
+    except Exception:
+        pass
+    try:
+        return int(os.getenv("YTDLP_MAX_PLAYLIST_ITEMS", str(default)))
+    except Exception:
+        return default
+
+
+# Cache de elecciones de playlist (token -> url original)
+PLAYLIST_CHOICES: dict[str, str] = {}
 
 # ========= Estado/Flags globales =========
 PAUSE_EVT: asyncio.Event = asyncio.Event()
@@ -241,7 +266,18 @@ def pick_outdir(kind: str, payload: dict[str, Any], base: Path) -> Path:
     if kind == "url":
         u = payload.get("url", "")
         low = u.lower()
-        if any(d in low for d in ["youtube.com/watch", "youtu.be/"]):
+        if any(
+            d in low
+            for d in [
+                "youtube.com/watch",
+                "youtu.be/",
+                "youtube.com/playlist",
+                "youtube.com/shorts",
+                "youtube.com/channel/",
+                "youtube.com/@",
+                "youtube.com/c/",
+            ]
+        ):
             return base / "youtube"
         if low.startswith("magnet:") or low.endswith(".torrent"):
             return base / "torrents"
@@ -256,25 +292,21 @@ def pick_outdir(kind: str, payload: dict[str, Any], base: Path) -> Path:
 
 
 # ========= UI Helpers (menús y mensajes bonitos) =========
-
-
 def mk_main_menu(paused: bool) -> InlineKeyboardMarkup:
-    # Botones principales
     row1 = [
-        InlineKeyboardButton("🚀 Ejecutar ahora", callback_data="act:run"),
+        InlineKeyboardButton("▶️ Comenzar ahora", callback_data="act:run"),
         InlineKeyboardButton("📋 Ver cola", callback_data="act:list"),
     ]
     row2 = [
         InlineKeyboardButton("📊 Estado", callback_data="act:status"),
         InlineKeyboardButton("⏰ Cambiar hora", callback_data="act:when"),
     ]
-    # Botón de pausa o reanudar según estado
     row3 = [
         InlineKeyboardButton(
             ("▶️ Reanudar" if paused else "⏸️ Pausar"),
             callback_data=("act:resume" if paused else "act:pause"),
         ),
-        InlineKeyboardButton("🗓️ Schedule", callback_data="act:sched:open"),  # <— nuevo
+        InlineKeyboardButton("🗓️ Schedule", callback_data="act:sched:open"),
     ]
     return InlineKeyboardMarkup([row1, row2, row3])
 
@@ -302,6 +334,7 @@ def fmt_start_message_html() -> str:
         "• Links de Telegram (<code>https://t.me/...</code>)\n"
         "• URLs http/https/magnet\n"
         "• Medios reenviados (video/audio/documento)\n\n"
+        "ℹ️ Comparte un enlace; si es una lista de YouTube te preguntaré si quieres sólo el video o la lista completa.\n\n"
         f"⏰ Programado diario a las <b>{settings.SCHEDULE_HOUR:02d}:00</b> (<code>{settings.TIMEZONE}</code>).\n"
         "Usa los botones para control rápido o /help."
     )
@@ -313,6 +346,51 @@ def fmt_status_message_html() -> str:
         "📊 <b>Estado actual</b>\n"
         f"• Modo: {'<b>PAUSADO</b> ⏸️' if p else '<b>ACTIVO</b> ▶️'}\n"
         f"• Hora programada: <b>{settings.SCHEDULE_HOUR:02d}:00</b> (<code>{settings.TIMEZONE}</code>)\n"
+    )
+
+
+# ========= Handlers auxiliares (playlists, etc) =========
+def _is_youtube(u: str) -> bool:
+    low = u.lower()
+    return (
+        "youtu.be/" in low
+        or "youtube.com/watch" in low
+        or "youtube.com/playlist" in low
+        or "youtube.com/shorts" in low
+        or "youtube.com/channel/" in low
+        or "youtube.com/@" in low
+        or "youtube.com/c/" in low
+    )
+
+
+def _has_playlistish(u: str) -> tuple[bool, str]:
+    """
+    Devuelve (True, 'radio'|'list') si la URL parece playlist (list=...) o radio (start_radio=1).
+    Para /playlist?... forzamos 'list'.
+    """
+    try:
+        parsed = urlparse(u)
+        q = parse_qs(parsed.query)
+        if parsed.path.startswith("/playlist") and "list" in q:
+            return True, "list"
+        if "start_radio" in q and (q["start_radio"][0] in ("1", "true", "yes")):
+            return True, "radio"
+        if "list" in q:
+            return True, "list"
+        return False, ""
+    except Exception:
+        return False, ""
+
+
+def _mk_playlist_choice_kb(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("▶️ Sólo este video", callback_data=f"pl:one:{token}"),
+                InlineKeyboardButton("📚 Toda la lista", callback_data=f"pl:all:{token}"),
+            ],
+            [InlineKeyboardButton("❌ Cancelar", callback_data=f"pl:cancel:{token}")],
+        ]
     )
 
 
@@ -492,19 +570,166 @@ async def run_cycle(app, force_all: bool = False, notify_chat_id: int | None = N
                                 pass
                             ok = True
 
-                        elif any(d in low for d in ["youtube.com/watch", "youtu.be/"]):
+                        elif any(
+                            d in low
+                            for d in [
+                                "youtube.com/watch",
+                                "youtu.be/",
+                                "youtube.com/playlist",
+                                "youtube.com/shorts",
+                                "youtube.com/channel/",
+                                "youtube.com/@",
+                                "youtube.com/c/",
+                            ]
+                        ):
                             # ==== yt-dlp cancelable ====
                             RUNNING["ytdlp_proc"] = None
 
                             def _on_start(p):
                                 RUNNING["ytdlp_proc"] = p
 
-                            ok = await ytdlp.download_proc(
-                                url, outdir, on_start=_on_start, cancel_evt=PAUSE_EVT
+                            # 1) Decisión desde payload, si existe
+                            allow_playlist = payload.get("allow_playlist", None)
+
+                            # 2) Blindaje: si es YouTube “playlist/radio” y NO hay decisión guardada,
+                            #    fuerza vídeo único (evita que se quede resolviendo radios infinitas)
+                            def _has_playlistish_q(u: str) -> bool:
+                                try:
+                                    q = parse_qs(urlparse(u).query)
+                                    if "start_radio" in q and (
+                                        q["start_radio"][0] in ("1", "true", "yes")
+                                    ):
+                                        return True
+                                    return "list" in q
+                                except Exception:
+                                    return False
+
+                            if allow_playlist is None and _has_playlistish_q(url):
+                                allow_playlist = (
+                                    False  # fuerza --no-playlist si no hay elección explícita
+                                )
+
+                            # Log útil para depurar:
+                            print(
+                                f"[YTDLP][guard] url_has_playlistish={_has_playlistish_q(url)} | allow_playlist={allow_playlist}"
                             )
+
+                            notify_chat_id = payload.get("notify_chat_id")
+
+                            progress_msg = None
+                            last_pct_sent = -1
+                            last_edit_ts = 0.0
+
                             if PAUSE_EVT.is_set():
                                 db_update_status(qid, "paused")
-                                # no limpiamos progress para mantener info
+                            notify_chat_id = payload.get("notify_chat_id")
+                            progress_msg = None
+                            last_pct_sent = -1
+                            last_edit_ts = 0.0
+
+                            async def _send_or_edit(txt: str):
+                                nonlocal progress_msg
+                                try:
+                                    if progress_msg is None:
+                                        if notify_chat_id:
+                                            progress_msg = await app.bot.send_message(
+                                                chat_id=notify_chat_id, text=txt
+                                            )
+                                    else:
+                                        if notify_chat_id:
+                                            # evita “Message is not modified”
+                                            if progress_msg.text != txt:
+                                                progress_msg = await app.bot.edit_message_text(
+                                                    chat_id=notify_chat_id,
+                                                    message_id=progress_msg.message_id,
+                                                    text=txt,
+                                                )
+                                except Exception:
+                                    pass
+
+                            async def _send_playlist_info(ev: dict):
+                                title = ev.get("title") or "Playlist"
+                                sample = ev.get("sample") or []
+                                limit = _get_playlist_limit()  # <-- lee .env aquí
+
+                                lines = [
+                                    f"📚 <b>{title}</b> — mostrando hasta {limit} ítems (cap configurado)."
+                                ]
+                                if sample:
+                                    lines.append("Primeros ítems:")
+                                    for s in sample:
+                                        lines.append(
+                                            f"  #{s.get('index', '?')}: {s.get('title', '(sin título)')}"
+                                        )
+                                await _send_or_edit("\n".join(lines))
+
+                            def _tg_progress_cb(ev: dict):
+                                # playlist summary
+                                if ev.get("event") == "playlist_info":
+                                    # usa tu mismo 'limit' que calculas antes al llamar probe_playlist
+                                    asyncio.create_task(
+                                        _send_playlist_info(ev)
+                                    )  # _send_playlist_info calcula limit internamente
+                                    return
+                                # Notificación por tandas (cada 4, configurable)
+                                if ev.get("event") == "batch":
+                                    done = ev.get("done", 0)
+                                    asyncio.create_task(
+                                        _send_or_edit(f"✅ {done} archivo(s) completados…")
+                                    )
+                                    return
+
+                                # Throttle progreso % como antes
+                                nonlocal last_pct_sent, last_edit_ts
+                                pct = int(ev.get("percent", 0))
+                                now = asyncio.get_event_loop().time()
+                                if (pct == last_pct_sent) or ((now - last_edit_ts) < 3.0):
+                                    return
+                                last_pct_sent = pct
+                                last_edit_ts = now
+                                txt = f"⬇️ Descargando… {pct}%"
+                                if ev.get("speed"):
+                                    txt += f" — {ev['speed']}"
+                                if ev.get("eta"):
+                                    txt += f" — ETA {ev['eta']}"
+                                asyncio.create_task(_send_or_edit(txt))
+
+                            # Mensaje inicial
+                            if notify_chat_id:
+                                await _send_or_edit("⬇️ Preparando descarga…")
+
+                            # Intento con callback de progreso (si la función lo soporta)
+                            try:
+                                ok = await ytdlp.download_proc(
+                                    url,
+                                    outdir,
+                                    on_start=_on_start,
+                                    cancel_evt=PAUSE_EVT,
+                                    allow_playlist=bool(payload.get("allow_playlist", False)),
+                                    progress_cb=_tg_progress_cb,
+                                    max_items=int(payload.get("max_items") or 0)
+                                    or _get_playlist_limit(),
+                                )
+                            except TypeError as _e:
+                                logging.warning(
+                                    "download_proc() no acepta 'progress_cb'; reintentando sin callback: %s",
+                                    _e,
+                                )
+                                ok = await ytdlp.download_proc(
+                                    url,
+                                    outdir,
+                                    on_start=_on_start,
+                                    cancel_evt=PAUSE_EVT,
+                                    allow_playlist=bool(payload.get("allow_playlist", False)),
+                                )
+
+                            # Mensaje final
+                            if notify_chat_id:
+                                if ok:
+                                    await _send_or_edit("✅ Descarga completada.")
+                                else:
+                                    await _send_or_edit("❌ Error en la descarga.")
+
                         else:
                             if aria2_enabled():
                                 try:
@@ -659,7 +884,7 @@ async def run_cycle(app, force_all: bool = False, notify_chat_id: int | None = N
                     print(f"[DBG] excepcion en ciclo id={qid}: {e!r}")
                     db_update_status(qid, "error")
 
-                    # Fi# Ceder control para no bloquear el loop
+                    #  Ceder control para no bloquear el loop
                     await asyncio.sleep(0)
 
         tasks.append(asyncio.create_task(_worker()))
@@ -841,6 +1066,64 @@ async def cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data == "act:back":
             txt, kb = refresh_menu_html()
             await safe_edit(query, txt, kb)
+        elif data.startswith("pl:"):
+            # pl:one:<token> | pl:all:<token> | pl:cancel:<token>
+            try:
+                _, action, token = data.split(":", 2)
+            except ValueError:
+                await query.edit_message_text("Solicitud inválida.")
+                return
+
+            url = PLAYLIST_CHOICES.pop(token, None)
+            if not url:
+                await query.edit_message_text("Esta solicitud expiró. Envía el enlace de nuevo.")
+                return
+
+            if action == "cancel":
+                await query.edit_message_text("Operación cancelada.")
+                return
+
+            allow_playlist = action == "all"
+            # Encolar con flag allow_playlist para yt-dlp
+            scheduled_at = datetime.now(tz=TZ).replace(
+                hour=settings.SCHEDULE_HOUR, minute=0, second=0, microsecond=0
+            )
+            if scheduled_at <= datetime.now(tz=TZ):
+                scheduled_at += timedelta(days=1)
+
+            db_add(
+                "url",
+                {
+                    "url": url,
+                    "allow_playlist": allow_playlist,
+                    "notify_chat_id": query.message.chat_id,
+                },
+                scheduled_at,
+            )
+
+            # Mensaje UX: guía siguiente paso
+            # ¿24/7 o ventana?
+            is_always = db_get_flag("SCHED_ENABLED", "1") == "0"
+            rows = db_list(limit=9999)  # rápido, para contar
+            qcount = len(rows) if rows else 1
+
+            if is_always:
+                hint = (
+                    "Encolado. Modo 24/7: iniciaré en breve. "
+                    "Usa /list para ver la cola o /pause para pausar."
+                )
+            else:
+                hint = (
+                    f"Encolado. La cola iniciará automáticamente a las "
+                    f"{settings.SCHEDULE_HOUR:02d}:00. Usa /list para ver la cola o /now para ejecutar ahora."
+                )
+
+            await query.edit_message_text(
+                "📹 Se descargará "
+                + ("📚 la lista completa." if allow_playlist else "▶️ sólo este video.")
+                + f"\nTienes {qcount} elemento(s) en cola.\n"
+                + hint
+            )
         else:
             await query.edit_message_text(
                 "🤔 Acción no reconocida.", reply_markup=mk_main_menu(is_paused())
@@ -1111,7 +1394,22 @@ async def intake(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 2) URLs/magnets (excluye t.me)
     urls = [u for u in extract_urls(text) if not u.lower().startswith("https://t.me/")]
     for u in urls:
-        db_add("url", {"url": u}, scheduled_at)
+        is_pl, kind = _has_playlistish(u)
+        if _is_youtube(u) and is_pl:
+            # Preguntar al usuario: vídeo único o lista completa
+            token = secrets.token_hex(8)
+            PLAYLIST_CHOICES[token] = u
+            label = "lista (Radio)" if kind == "radio" else "lista"
+            await m.reply_text(
+                f"Detecté un enlace de YouTube con {label}. ¿Qué deseas descargar?",
+                reply_markup=_mk_playlist_choice_kb(token),
+                disable_web_page_preview=True,
+            )
+            # No encolamos todavía este enlace. Pasamos al siguiente (si lo hubiera).
+            continue
+
+        # Enlaces "normales": encola directo
+        db_add("url", {"url": u, "notify_chat_id": m.chat_id}, scheduled_at)
         c_web_urls += 1
         enqueued_any = True
 
@@ -1187,9 +1485,25 @@ async def intake(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts.append(f"{c_media} medio(s) reenviado(s)")
     summary = " + ".join(parts) if parts else "tarea(s)"
 
+    # ¿24/7 o ventana?
+    is_always = db_get_flag("SCHED_ENABLED", "1") == "0"
+    rows = db_list(limit=9999)
+    qcount = len(rows) if rows else 1
+
+    if is_always:
+        next_hint = (
+            "Usa /list para ver la cola, /pause para pausar o /now para forzar un ciclo inmediato."
+        )
+    else:
+        next_hint = (
+            f"La cola iniciará automáticamente a las {settings.SCHEDULE_HOUR:02d}:00. "
+            "Usa /list para ver la cola o /now para ejecutar ahora."
+        )
+
     await m.reply_text(
-        f"✅ {summary} encolado(s) para "
-        f"{scheduled_at.strftime('%Y-%m-%d %H:%M')} ({settings.TIMEZONE})."
+        f"✅ {summary} encolado(s).\n"
+        f"Actualmente tienes {qcount} elemento(s) en la cola.\n"
+        f"{next_hint}"
     )
 
 
@@ -1289,16 +1603,49 @@ async def main():
     Path(settings.DOWNLOAD_DIR).mkdir(parents=True, exist_ok=True)
 
     # Telethon (usuario)
-    if not (settings.API_ID and settings.API_HASH and settings.TELETHON_STRING):
-        raise SystemExit("Falta API_ID/API_HASH/TELETHON_STRING en .env")
-    tclient = TelegramClient(
-        StringSession(settings.TELETHON_STRING), settings.API_ID, settings.API_HASH
-    )
-    await tclient.connect()
-    if not await tclient.is_user_authorized():
-        raise SystemExit(
-            "La sesión de Telethon no está autorizada. Ejecuta session_setup.py de nuevo."
-        )
+    if not settings.USE_TELETHON:
+        tclient = None
+    else:
+        if not (settings.API_ID and settings.API_HASH):
+            raise SystemExit("Falta API_ID/API_HASH en .env")
+
+        import platform
+
+        from telethon.errors import AuthKeyDuplicatedError
+
+        try:
+            if settings.TELETHON_SESSION_MODE.lower() == "file":
+                # Sesión por máquina (recomendado si usas varias PCs)
+                sess_dir = Path(settings.SESSIONS_DIR)
+                sess_dir.mkdir(parents=True, exist_ok=True)
+                host = platform.node() or "host"
+                sess_name = f"{settings.TELETHON_SESSION_BASE}_{host}"
+                sess_path = sess_dir / (sess_name + ".session")
+                tclient = TelegramClient(str(sess_path), settings.API_ID, settings.API_HASH)
+            else:
+                # Modo 'string' (como antes)
+                if not settings.TELETHON_STRING:
+                    raise SystemExit("Falta TELETHON_STRING (o cambia TELETHON_SESSION_MODE=file).")
+                tclient = TelegramClient(
+                    StringSession(settings.TELETHON_STRING),
+                    settings.API_ID,
+                    settings.API_HASH,
+                )
+
+            await tclient.connect()
+            if not await tclient.is_user_authorized():
+                raise SystemExit(
+                    "La sesión de Telethon no está autorizada. Ejecuta session_setup.py de nuevo (o usa modo file)."
+                )
+
+        except AuthKeyDuplicatedError:
+            # Mensaje claro y salida controlada
+            raise SystemExit(
+                "Telethon: esta sesión se usó simultáneamente en otra IP. "
+                "Soluciones:\n"
+                " - Usa TELETHON_SESSION_MODE=file para tener sesiones por máquina, o\n"
+                " - Genera una TELETHON_STRING distinta en esta PC."
+            )
 
     # Bot de Telegram
     if not settings.BOT_TOKEN:

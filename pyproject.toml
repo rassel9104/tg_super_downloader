@@ -43,7 +43,24 @@ target-version = ["py313"]
 line-length = 100
 target-version = "py313"
 lint.select = ["E","F","I","UP","B","SIM","ASYNC","RUF"]
-lint.ignore = ["E501"]
+lint.ignore = [
+  "E501",   # líneas largas
+  "I001",   # imports no ordenados
+  "UP006",  # usar list en vez de List
+  "UP007",  # usar X|Y en vez de Optional
+  "UP035",  # typing.Dict/List/Tuple deprecado
+  "SIM105", # try/except/pass -> suppress
+  "SIM102", # if anidados
+  "SIM103", # return directo
+  "ASYNC210", # requests en async
+  "RUF005", # concatenación en vez de unpacking
+  "RUF006", # create_task sin referencia
+  "RUF019", # dict.get en vez de if "key" in dict
+  "UP041",  # asyncio.TimeoutError en vez de TimeoutError
+  "RUF001", # caracteres unicode ambiguos
+  "B904",   # raise ... from e
+]
+
 
 [tool.mypy]
 python_version = "3.13"

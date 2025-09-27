@@ -1,124 +1,406 @@
-# tgdl/adapters/downloaders/ytdlp.py
 from __future__ import annotations
+
+import asyncio
+import contextlib
+import os
+import re
+import shutil
+from collections.abc import Callable
 from pathlib import Path
-import subprocess, shutil, asyncio
+from typing import Any
+from urllib.parse import parse_qs, urlparse
 
-from tgdl.config.settings import settings
+# Ajusta si tu settings vive en otra ruta
+try:
+    from tgdl.config.settings import settings
+except Exception:
 
-# ==== Modo existente (sincrónico) se mantiene ====
+    class _Dummy:
+        YTDLP_FORMAT = "bv*+ba/b"
+        YTDLP_MERGE_FORMAT = "mp4"
+        YTDLP_CONCURRENT_FRAGMENTS = 1
+        YTDLP_THROTTLED_RATE = 1048576
+        YTDLP_HTTP_CHUNK_SIZE = 1048576
+        YTDLP_COOKIES = None
+        YTDLP_PROXY = None
+        YTDLP_FORCE_IPV4 = False
 
-class _YDLLogger:
-    def debug(self, msg):
-        if "Deleting original file" in msg:
-            return
-        print(f"[YTDLP] {msg}")
-    def warning(self, msg): print(f"[YTDLP][WARN] {msg}")
-    def error(self, msg):   print(f"[YTDLP][ERR] {msg}")
+    settings = _Dummy()
 
-def _download_via_module(url: str, outdir: Path) -> bool:
+# ================= Utils =================
+
+
+def _env_int(name: str, default: int) -> int:
     try:
-        from yt_dlp import YoutubeDL
-    except Exception as e:
-        print(f"[YTDLP] módulo no disponible: {e!r}")
+        v = os.getenv(name)
+        return int(v) if v not in (None, "", "None") else default
+    except Exception:
+        return default
+
+
+def _cookies_path_valid() -> str | None:
+    try:
+        ck = getattr(settings, "YTDLP_COOKIES", None)
+        if not ck:
+            return None
+        p = Path(ck)
+        return str(p) if p.exists() else None
+    except Exception:
+        return None
+
+
+def _looks_403(lines: list[str]) -> bool:
+    pat = re.compile(r"\b(HTTP\s*403|Forbidden)\b", re.I)
+    return any(pat.search(x or "") for x in lines)
+
+
+def _url_has_playlistish(url: str) -> bool:
+    try:
+        return "list" in parse_qs(urlparse(url).query)
+    except Exception:
         return False
 
-    ydl_opts = {
-        "outtmpl": str(outdir / "%(title).80s.%(ext)s"),
-        "restrictfilenames": True,
-        "format": "bv*+ba/b",
-        "merge_output_format": "mp4",
-        "concurrent_fragment_downloads": 4,
-        "logger": _YDLLogger(),
-        "postprocessors": [{"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}],
-    }
-    with YoutubeDL(ydl_opts) as ydl:
-        errors = ydl.download([url])
-    ok = (errors == 0)
-    if not ok:
-        print(f"[YTDLP] terminó con errores={errors}")
-    return ok
 
-def _download_via_exec(url: str, outdir: Path) -> bool:
-    exe = shutil.which("yt-dlp") or shutil.which("yt-dlp.exe")
-    if not exe:
-        print("[YTDLP] no se encontró yt-dlp en PATH")
-        return False
+# ================= Common args =================
+
+
+def _common_args(
+    url: str,
+    outtmpl: str,
+    use_cookies: bool,
+    allow_playlist: bool,
+    max_items: int | None = None,
+) -> list[str]:
+    fmt = getattr(settings, "YTDLP_FORMAT", "bv*+ba/b")
+    mrg = getattr(settings, "YTDLP_MERGE_FORMAT", "mp4")
+    cfd = str(getattr(settings, "YTDLP_CONCURRENT_FRAGMENTS", 1))
+    thr = str(getattr(settings, "YTDLP_THROTTLED_RATE", 1048576))
+    chn = str(getattr(settings, "YTDLP_HTTP_CHUNK_SIZE", 1048576))
+
+    args: list[str] = [
+        "-o",
+        outtmpl,
+        "-f",
+        fmt,
+        "--merge-output-format",
+        mrg,
+        "--concurrent-fragments",
+        cfd,
+        "--retries",
+        "15",
+        "--fragment-retries",
+        "15",
+        "--throttled-rate",
+        thr,
+        "--http-chunk-size",
+        chn,
+        "--sleep-requests",
+        "0.2",
+        "--socket-timeout",
+        "30",
+        "--geo-bypass",
+        "--geo-bypass-country",
+        "US",
+        "--extractor-args",
+        "youtube:player_client=android,web",
+        "--progress-template",
+        "download:%(progress._percent_str)s %(progress._speed_str)s ETA %(progress._eta_str)s",
+        "--progress-template",
+        "postprocess:%(progress._percent_str)s post",
+        "--no-warnings",
+    ]
+
+    if not allow_playlist:
+        args.append("--no-playlist")
+    else:
+        if max_items and max_items > 0:
+            # Límite robusto (soporta Mix/Radio, índices desplazados, etc.)
+            args += ["--playlist-start", "1"]
+            args += ["--playlist-end", str(max_items)]
+            args += ["--playlist-items", f"1-{max_items}"]  # redundante pero inofensivo
+            args += ["--max-downloads", str(max_items)]  # corte duro universal
+
+    if use_cookies:
+        ck = _cookies_path_valid()
+        if ck:
+            args += ["--cookies", ck]
+
+    proxy = getattr(settings, "YTDLP_PROXY", None)
+    if proxy:
+        args += ["--proxy", proxy]
+
+    if getattr(settings, "YTDLP_FORCE_IPV4", False):
+        args += ["--source-address", "0.0.0.0"]
+
+    args.append(url)
+    return args
+
+
+# --- NUEVO  ---
+
+
+def _subfolder_mode() -> str:
+    # 'playlist' (default), 'channel', 'none'
+    try:
+        v = getattr(settings, "YTDLP_SUBFOLDERS", None)
+        if not v:
+            v = os.getenv("YTDLP_SUBFOLDERS", "playlist")
+        return str(v).strip().lower()
+    except Exception:
+        return "playlist"
+
+
+def _is_channel_url(url: str) -> bool:
+    low = url.lower()
+    return any(p in low for p in ["youtube.com/channel/", "youtube.com/@", "youtube.com/c/"])
+
+
+def _make_outtmpl(outdir: Path, url: str, allow_playlist: bool) -> str:
+    """
+    Decide plantilla - crea subcarpetas legibles sin tocar la DB:
+    - playlist mode:   out/ %(playlist_title)s/%(title)s [id].ext
+    - channel mode:    out/ %(uploader)s/%(title)s [id].ext (fallback %(channel)s)
+    - none/default:    out/ %(title)s [id].ext
+    """
+    base = str(outdir).rstrip("\\/")
+    mode = _subfolder_mode()
+    if allow_playlist and mode == "playlist":
+        return f"{base}/%(playlist_title)s/%(title).200B [%(id)s].%(ext)s"
+    if _is_channel_url(url) and mode in (
+        "channel",
+        "playlist",
+    ):  # permitimos carpeta también en 'playlist'
+        # uploader es más estable que channel en muchos casos
+        return f"{base}/%(uploader)s/%(title).200B [%(id)s].%(ext)s"
+    return f"{base}/%(title).200B [%(id)s].%(ext)s"
+
+
+# ================= Probe playlist (solo para mostrar títulos) =================
+
+
+async def probe_playlist(url: str, limit: int = 10) -> dict[str, Any]:
+    yt = shutil.which("yt-dlp") or "yt-dlp"
+    limit = max(1, int(limit or 10))
     cmd = [
-        exe,
-        "-o", str(outdir / "%(title).80s.%(ext)s"),
-        "-f", "bv*+ba/b",
-        "--merge-output-format", "mp4",
-        "--concurrent-fragments", "4",
+        yt,
+        "--flat-playlist",
+        "--print",
+        "playlist:title",
+        "--print",
+        "playlist_count",
+        "--print",
+        "%(playlist_index)s|%(id)s|%(title)s",
         url,
     ]
-    print(f"[YTDLP] exec: {' '.join(cmd)}")
+    print(f"[YTDLP][probe] launching: {yt} --flat-playlist --print ...")
     try:
-        cp = subprocess.run(cmd, capture_output=False, check=False)
-        if cp.returncode != 0:
-            print(f"[YTDLP][ERR] código {cp.returncode}")
-            return False
-        return True
-    except Exception as e:
-        print(f"[YTDLP] excepción exec: {e!r}")
-        return False
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        out, _ = await proc.communicate()
+        lines = (out or b"").decode("utf-8", "ignore").splitlines()
 
-def download(url: str, outdir: Path | None = None) -> bool:
-    outdir = Path(outdir or settings.DOWNLOAD_DIR)
-    outdir.mkdir(parents=True, exist_ok=True)
-    if _download_via_module(url, outdir):
-        return True
-    return _download_via_exec(url, outdir)
+        title: str | None = None
+        count: int | None = None
+        sample: list[dict[str, Any]] = []
 
-# ==== NUEVO: runner async cancelable (subproceso) ====
-
-async def download_proc(url: str, outdir: Path, on_start=None, cancel_evt: asyncio.Event | None = None) -> bool:
-    """
-    Lanza yt-dlp como subproceso (async) y permite cancelación (terminate) si cancel_evt está activo.
-    Devuelve True si terminó con 0; False si cancelado o error.
-    """
-    outdir = Path(outdir or settings.DOWNLOAD_DIR)
-    outdir.mkdir(parents=True, exist_ok=True)
-
-    exe = shutil.which("yt-dlp") or shutil.which("yt-dlp.exe")
-    if not exe:
-        # Si no hay binario, último recurso: ejecutar módulo en thread (no cancelable)
-        return await asyncio.to_thread(download, url, outdir)
-
-    cmd = [
-        exe,
-        "-o", str(outdir / "%(title).80s.%(ext)s"),
-        "-f", "bv*+ba/b",
-        "--merge-output-format", "mp4",
-        "--concurrent-fragments", "4",
-        url,
-    ]
-    print(f"[YTDLP][ASYNC] {' '.join(cmd)}")
-
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.STDOUT,
-    )
-    if on_start:
-        try:
-            on_start(proc)
-        except Exception:
-            pass
-
-    # Poll cooperativo para cancelación
-    while True:
-        try:
-            rc = await asyncio.wait_for(proc.wait(), timeout=0.5)
-            return rc == 0
-        except asyncio.TimeoutError:
-            if cancel_evt and cancel_evt.is_set():
-                # Terminar proceso y reportar cancelación
-                try:
-                    proc.terminate()  # Windows: envía CTRL-BREAK amable; si no, kill
-                except ProcessLookupError:
+        for ln in lines:
+            s = (ln or "").strip()
+            if not s:
+                continue
+            if s.isdigit():
+                if count is None:
+                    count = int(s)
+                continue
+            if "|" in s:
+                parts = s.split("|", 2)
+                if len(parts) == 3:
+                    try:
+                        idx = int(parts[0])
+                    except Exception:
+                        idx = None
+                    sample.append({"index": idx, "id": parts[1], "title": parts[2]})
+                if len(sample) >= limit:
                     pass
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=3)
-                except asyncio.TimeoutError:
-                    proc.kill()
-                return False
+                continue
+            if title is None:
+                title = s
+
+        print(f"[YTDLP][probe] title={title!r} count={count} sample={len(sample)}")
+        return {"title": title, "count": count, "sample": sample[:limit]}
+    except Exception as e:
+        print(f"[YTDLP][probe][ERR] {e!r}")
+        return {"title": None, "count": None, "sample": []}
+
+
+# ================= Descarga principal =================
+
+
+async def download_proc(
+    url: str,
+    outdir: Path,
+    on_start: Callable[[asyncio.subprocess.Process], None] | None = None,
+    cancel_evt: asyncio.Event | None = None,
+    allow_playlist: bool = False,
+    progress_cb: Callable[[dict[str, Any]], None] | None = None,
+    max_items: int | None = None,
+) -> bool:
+    print(
+        f"[YTDLP][guard] url_has_playlistish={_url_has_playlistish(url)} | allow_playlist={allow_playlist}"
+    )
+
+    # Normaliza tope y batch
+    if max_items is None:
+        max_items = _env_int("YTDLP_MAX_PLAYLIST_ITEMS", 0) or None
+    BATCH_NOTIFY_EVERY = _env_int("YTDLP_BATCH_EVERY", 4)  # notificar cada N archivos completados
+
+    # Pre-sondeo para avisar títulos al usuario
+    if allow_playlist and progress_cb is not None:
+        limit = max_items or _env_int("YTDLP_MAX_PLAYLIST_ITEMS", 24)
+        meta = await probe_playlist(url, limit=limit)
+        with contextlib.suppress(Exception):
+            progress_cb(
+                {
+                    "event": "playlist_info",
+                    "title": meta.get("title"),
+                    "count": meta.get("count"),
+                    "sample": meta.get("sample") or [],
+                }
+            )
+
+    async def _run(use_cookies: bool) -> tuple[bool, list[str]]:
+        yt = shutil.which("yt-dlp") or "yt-dlp"
+        outtmpl = _make_outtmpl(outdir, url, allow_playlist)
+        args = [
+            yt,
+            *_common_args(
+                url=url,
+                outtmpl=outtmpl,
+                use_cookies=use_cookies,
+                allow_playlist=allow_playlist,
+                max_items=max_items,
+            ),
+        ]
+
+        outdir.mkdir(parents=True, exist_ok=True)
+        print(f"[YTDLP][exec] {yt} -o {outtmpl} ... (dir={outdir}) [cookies={use_cookies}]")
+
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        if on_start:
+            with contextlib.suppress(Exception):
+                on_start(proc)
+
+        lines: list[str] = []
+        max_secs = _env_int("YTDLP_MAX_RUN_SECS", 900)  # 15 min por defecto
+
+        # Seguimiento por ítem
+        items_started = 0
+        items_done = 0
+
+        # Patrones comunes
+        re_item_start = re.compile(r"^\[download\]\s+Destination:\s+(.+)$", re.I)
+        re_item_done = re.compile(r"^\[download\]\s+100%\s", re.I)
+        re_item_skip = re.compile(r"^\[download\]\s+(.+?) has already been downloaded", re.I)
+        re_merging = re.compile(
+            r"^\[Merger\]\s+Merging formats into", re.I
+        )  # a veces el 100% no se ve claro
+
+        async def _pump():
+            nonlocal items_started, items_done
+            while True:
+                if cancel_evt and cancel_evt.is_set():
+                    with contextlib.suppress(Exception):
+                        proc.kill()
+                    return
+                chunk = await proc.stdout.readline()
+                if not chunk:
+                    break
+                ln = chunk.decode("utf-8", "ignore").rstrip("\r\n")
+                lines.append(ln)
+
+                # === Consola: seguimiento por ítem ===
+                m_start = re_item_start.search(ln)
+                if m_start:
+                    items_started += 1
+                    print(f"[YTDLP][item] start #{items_started}: {m_start.group(1)}")
+
+                # MARCAMOS "hecho" por cualquiera de estas señales:
+                if re_item_done.search(ln) or re_item_skip.search(ln) or re_merging.search(ln):
+                    items_done += 1
+                    print(f"[YTDLP][item] done  #{items_done}")
+                    # Telegram: batched (cada N)
+                    if (
+                        progress_cb
+                        and BATCH_NOTIFY_EVERY > 0
+                        and (items_done % BATCH_NOTIFY_EVERY == 0)
+                    ):
+                        with contextlib.suppress(Exception):
+                            progress_cb({"event": "batch", "done": items_done})
+
+                # progreso básico (porcentaje/speed/ETA) — opcional
+                if progress_cb:
+                    m = re.search(r"(\d{1,3}(?:\.\d)?)%\s+([^\s]+/s).+?ETA\s+([0-9:]{2,})", ln)
+                    if m:
+                        try:
+                            pct = float(m.group(1))
+                        except Exception:
+                            pct = 0.0
+                        with contextlib.suppress(Exception):
+                            progress_cb(
+                                {
+                                    "event": "progress",
+                                    "percent": int(pct),
+                                    "speed": m.group(2),
+                                    "eta": m.group(3),
+                                }
+                            )
+
+        try:
+            await asyncio.wait_for(_pump(), timeout=max_secs)
+            rc = await asyncio.wait_for(proc.wait(), timeout=60)
+            # rc==101 => "max-downloads alcanzado" (cuenta como ÉXITO)
+            ok = rc == 0 or rc == 101
+            if not ok:
+                tail = lines[-40:] if len(lines) > 40 else lines
+                print(f"[YTDLP][done] rc={rc} | lines={len(lines)} | tail:\n" + "\n".join(tail))
+            else:
+                print(
+                    f"[YTDLP][done] rc={rc} | lines={len(lines)} | started={items_started} done={items_done}"
+                )
+            return ok, lines
+        except TimeoutError:
+            print(f"[YTDLP][TOUT] killing process after {max_secs}s")
+            with contextlib.suppress(Exception):
+                proc.kill()
+            return False, lines
+        except Exception as e:
+            print(f"[YTDLP][ERR] {e!r}")
+            with contextlib.suppress(Exception):
+                proc.kill()
+            return False, lines
+
+    # 1º intento con cookies (si existen)
+    ok, lines = await _run(use_cookies=True)
+    if ok:
+        return True
+
+    # 2º intento sin cookies (fallback genérico)
+    if _looks_403(lines):
+        print("[YTDLP][retry] 403 detectado; reintentando SIN cookies…")
+    else:
+        print("[YTDLP][retry] rc!=0; reintentando SIN cookies como fallback…")
+    ok2, lines2 = await _run(use_cookies=False)
+    if ok2:
+        return True
+
+    # Tail final si también falla sin cookies
+    tail = lines2 or lines
+    tail = tail[-40:] if len(tail) > 40 else tail
+    print("[YTDLP][fail] sin cookies también falló. Tail:\n" + "\n".join(tail))
+    return False

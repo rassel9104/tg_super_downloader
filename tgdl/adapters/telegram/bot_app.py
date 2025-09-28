@@ -690,6 +690,14 @@ async def run_cycle(app, force_all: bool = False, notify_chat_id: int | None = N
     tclient: TelegramClient = BOT.tclient
     tasks = []
     for qid, kind, payload_json in rows:
+        # Diagnóstico por ítem (suave, no ruidoso)
+        try:
+            _p = json.loads(payload_json)
+            if kind == "url":
+                _u = (_p.get("url") or "")[:140]
+                print(f"[DBG] item#{qid} kind=url | aria2_enabled={aria2_enabled()} | url={_u!r}")
+        except Exception:
+            pass
         # Chequeo cooperativo de pausa antes de arrancar cada item
         if is_paused() or PAUSE_EVT.is_set():
             db_update_status(qid, "paused")
@@ -768,11 +776,33 @@ async def run_cycle(app, force_all: bool = False, notify_chat_id: int | None = N
                         elif "sourceforge.net/" in low:
                             try:
                                 direct, hdrs = await resolve_sourceforge_direct(url)
-                                if direct and aria2_enabled():
-                                    gid = aria2_add(direct, outdir, headers=hdrs)
+                                if aria2_enabled():
+                                    # Fallback si el resolver no entregó URL directa
+                                    target = direct or (
+                                        url
+                                        if low.endswith("/download")
+                                        else (url.rstrip("/") + "/download")
+                                    )
+                                    if not hdrs:
+                                        hdrs = {
+                                            "Referer": url,
+                                            "User-Agent": (
+                                                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+                                            ),
+                                            "Accept": "*/*",
+                                        }
+                                    gid = aria2_add(target, outdir, headers=hdrs)
                                     db_set_ext_id(qid, gid)
-                                    ok = True
+                                    # Espera cooperativa hasta completar (como MediaFire)
+                                    final = await _await_aria2_and_notify(
+                                        qid, gid, row_notify_chat_id, app.bot
+                                    )
+                                    ok = final == "complete"
                                 else:
+                                    print(
+                                        "[DBG] SourceForge: aria2_enabled()=False. Revisa RPC URL/secret/estado de aria2."
+                                    )
                                     ok = False
                             except Exception as e:
                                 print(f"[DBG] sourceforge error: {e!r}")

@@ -63,7 +63,10 @@ from tgdl.core.db import (
     db_update_status,
     is_paused,
 )
-from tgdl.utils.resolvers import resolve_mediafire_direct
+from tgdl.utils.resolvers import resolve_mediafire_direct, resolve_sourceforge_direct
+
+# Logger del módulo (evita F821 y nos da trazas controladas)
+logger = logging.getLogger(__name__)
 
 try:
     from tgdl.config.settings import settings  # si ya existe en tu proyecto
@@ -763,17 +766,8 @@ async def run_cycle(app, force_all: bool = False, notify_chat_id: int | None = N
                                 ok = False
 
                         elif "sourceforge.net/" in low:
-                            # Resolver a mirror final y enviar Referer/User-Agent a aria2
                             try:
-                                from tgdl.utils.resolvers import resolve_sourceforge_direct
-                            except Exception:
-                                resolve_sourceforge_direct = None
-                            try:
-                                direct, hdrs = (
-                                    (await resolve_sourceforge_direct(url))
-                                    if resolve_sourceforge_direct
-                                    else (None, None)
-                                )
+                                direct, hdrs = await resolve_sourceforge_direct(url)
                                 if direct and aria2_enabled():
                                     gid = aria2_add(direct, outdir, headers=hdrs)
                                     db_set_ext_id(qid, gid)
@@ -1640,11 +1634,15 @@ async def intake(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     disable_web_page_preview=True,
                 )
             except Exception:
-                await m.reply_text(
-                    f"Detecté un enlace de YouTube con {label}. ¿Qué deseas descargar?",
-                    reply_markup=_mk_playlist_choice_kb(token),
-                    disable_web_page_preview=True,
-                )
+                # No dejamos que un fallo DNS tumbe intake; si falla, seguimos el flujo sin preview.
+                try:
+                    await m.reply_text(
+                        f"Detecté un enlace de YouTube con {label}. ¿Qué deseas descargar?",
+                        reply_markup=_mk_playlist_choice_kb(token),
+                        disable_web_page_preview=True,
+                    )
+                except Exception as _e:
+                    logger.warning("reply_text failed (preview playlist): %r", _e)
             # No encolamos todavía este enlace. Pasamos al siguiente (si lo hubiera).
             continue
 

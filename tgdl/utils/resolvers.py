@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import re
 from urllib.parse import urlparse
 
@@ -78,42 +79,38 @@ def extract_mediafire_direct_link(html: str) -> str | None:
 
 async def resolve_sourceforge_direct(url: str) -> tuple[str | None, dict[str, str] | None]:
     """
-    Resuelve un enlace de SourceForge (normalmente termina en /download) a su URL
-    final de mirror (downloads|*.dl.sourceforge.net/...).
-
-    Devuelve (direct_url, headers) o (None, None) si no se puede resolver.
-    Los headers incluyen Referer y un User-Agent "de navegador" para evitar 403.
+    Resuelve un enlace de SourceForge (típicamente termina en /download) a la URL final
+    del mirror (p. ej. *.dl.sourceforge.net). No descarga el binario, solo sigue redirecciones.
+    Retorna (direct_url, headers) o (None, None).
     """
     try:
         host = (urlparse(url).hostname or "").lower()
-        if not any(host.endswith(h) for h in _ALLOWED_SF_HOSTS):
+        if not any(host == h or host.endswith("." + h) for h in _ALLOWED_SF_HOSTS):
             return None, None
+    except Exception:
+        return None, None
 
-        # Asegurar sufijo /download (según doc oficial se puede usar ese URL y seguir redirecciones).
-        # https://sourceforge.net/p/forge/documentation/Downloading%20files%20via%20the%20command%20line/
-        path = urlparse(url).path or ""
-        req_url = url if path.endswith("/download") else (url.rstrip("/") + "/download")
+    # Asegurar sufijo /download para que SF seleccione mirror
+    path = urlparse(url).path or ""
+    req_url = url if path.endswith("/download") else (url.rstrip("/") + "/download")
 
-        headers = {
-            "Referer": url,
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-            ),
-            "Accept": "*/*",
-        }
-        timeout = httpx.Timeout(20.0)
-        async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
-            # stream=True para no bajar el binario; solo headers/redirecciones
-            resp = await client.get(req_url, headers=headers, stream=True)
-            direct = str(resp.url) if resp is not None else None
-            try:
-                await resp.aclose()  # cierre explícito
-            except Exception:
-                pass
+    headers = {
+        "Referer": url,
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        ),
+        "Accept": "*/*",
+    }
+    try:
+        async with asyncio.timeout(30.0):
+            async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as cli:
+                resp = await cli.get(req_url, headers=headers, stream=True)
+                direct = str(resp.url) if resp is not None else None
+                with contextlib.suppress(Exception):
+                    await resp.aclose()
         if not direct:
             return None, None
-        # Aceptamos cualquier host final; normalmente *.dl.sourceforge.net o downloads.sourceforge.net
         return direct, headers
     except Exception:
         return None, None

@@ -762,6 +762,28 @@ async def run_cycle(app, force_all: bool = False, notify_chat_id: int | None = N
                                 print(f"[DBG] mediafire error: {e!r}")
                                 ok = False
 
+                        elif "sourceforge.net/" in low:
+                            # Resolver a mirror final y enviar Referer/User-Agent a aria2
+                            try:
+                                from tgdl.utils.resolvers import resolve_sourceforge_direct
+                            except Exception:
+                                resolve_sourceforge_direct = None
+                            try:
+                                direct, hdrs = (
+                                    (await resolve_sourceforge_direct(url))
+                                    if resolve_sourceforge_direct
+                                    else (None, None)
+                                )
+                                if direct and aria2_enabled():
+                                    gid = aria2_add(direct, outdir, headers=hdrs)
+                                    db_set_ext_id(qid, gid)
+                                    ok = True
+                                else:
+                                    ok = False
+                            except Exception as e:
+                                print(f"[DBG] sourceforge error: {e!r}")
+                                ok = False
+
                         elif any(
                             d in low
                             for d in [

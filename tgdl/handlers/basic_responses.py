@@ -123,7 +123,9 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         else (
                             "nota de voz"
                             if msg.voice
-                            else "video corto" if msg.video_note else "sticker"
+                            else "video corto"
+                            if msg.video_note
+                            else "sticker"
                         )
                     )
                 )

@@ -1,8 +1,8 @@
 # TG Super Downloader (uso hogareño)
 
-Bot doméstico para enviarle enlaces por Telegram y descargar archivos directamente a tu PC (Windows 11).  
-Soporta **HTTP/HTTPS**, **magnet:**, **.torrent**, **YouTube/streaming (yt-dlp)** y **media de Telegram (Telethon)**.  
-Incluye un **panel local** (FastAPI) para pausar/reanudar/ejecutar/cancelar/limpiar y ver progreso.
+Bot doméstico para enviarle enlaces por Telegram y descargar archivos directamente a tu PC (Windows 11).
+Soporta **HTTP/HTTPS**, **magnet:**, **.torrent**, **YouTube/streaming (yt-dlp)** y **media de Telegram (Telethon)**.
+Incluye un **panel local** (FastAPI + WebSocket) para pausar/reanudar/ejecutar/cancelar/limpiar y ver progreso en tiempo real.
 
 > ⚠️ Pensado para uso **personal** en red local. No multiusuario, no cuotas. Mantén tus credenciales y puertos privados.
 
@@ -11,36 +11,30 @@ Incluye un **panel local** (FastAPI) para pausar/reanudar/ejecutar/cancelar/limp
 ## ✨ Características
 
 - **Descargas desde Telegram**: reenvía un mensaje con media o un enlace y se encola automáticamente.
-- **HTTP/HTTPS** con **aria2** (JSON-RPC).
-- **Magnet y .torrent**:
-  - Magnet → lo toma aria2.
-  - `.torrent` (URL o archivo reenviado) → se pasa a aria2 con `aria2.addTorrent`.
-- **YouTube/otros** con **yt-dlp** (módulo o binario).
-- **Pausa/Reanuda/Cancela**:
-  - Pausa global: detiene aria2 y mata el proceso yt-dlp activo.
-  - Cancel por `id`: remueve en aria2 (si aplica) y borra parciales.
-- **Organización de carpetas** por origen:
-  ```
-  downloads/
-    torrents/
-    youtube/
-    example.com/
-    Telegram Canal X/
-  ```
-- **Panel local** (opcional) en `http://127.0.0.1:8080/`.
+- **HTTP/HTTPS/magnet/.torrent** con **aria2** (JSON-RPC).
+- **YouTube/otros** con **yt-dlp** (soporta playlists, canales, shorts).
+- **Media de Telegram** vía **Telethon** (sesión `string` o `file`).
+- **Scheduler**: ejecución diaria a la hora configurada o **ventana Start/Stop**.
+- **Panel local** (127.0.0.1) con:
+  - Filtros por estado y búsqueda.
+  - Encolar enlaces desde la UI.
+  - Progreso en tiempo real (WebSocket).
+- **Cancelación segura**:
+  - Aria2: remueve y borra parciales + sidecars (`.aria2`, `*.part`, `*.ytdl`).
+  - yt-dlp: mata proceso activo y limpia temporales recientes.
 
 ---
 
-## 🧱 Arquitectura (resumen)
+## 🧱 Arquitectura
 
-- **Bot (python-telegram-bot + Telethon)**: intake de mensajes y comandos; ciclo de descargas asíncrono **en segundo plano** (no bloquea los comandos).
+- **Bot**: `python-telegram-bot` + **Telethon** para intake de mensajes/comandos.
 - **Descargas**:
-  - `aria2` vía RPC (`addUri`, `addTorrent`, `pauseAll`, `remove`…).
-  - `yt-dlp` como **subproceso cancelable** (o módulo en thread si no hay binario).
-  - `Telethon` para media de Telegram con callback de progreso.
-- **DB SQLite**: tablas `queue`, `progress`, `kv`, `events` (+ `ext_id` para GID de aria2).
-- **Panel FastAPI**: REST + WebSocket con snapshot de estado cada 1s.
-- **Control interno**: servidor local en `127.0.0.1:8765` para `/pause`, `/resume`, `/run`, `/cancel/{id}`.
+  - `aria2` via RPC (`addUri`, `addTorrent`, `pauseAll`, `remove`…).
+  - `yt-dlp` como subproceso cancelable (seguimiento por stdout).
+  - `Telethon` para media con callback de progreso.
+- **DB SQLite**: `queue`, `progress`, `kv`, `events` (con `ext_id` de aria2).
+- **Panel FastAPI** (`tgdl/panel/api.py`): REST + WebSocket.
+- **Control local** en `http://127.0.0.1:8765` para `/pause`, `/resume`, `/run`, `/cancel/{id}`.
 
 ---
 
@@ -49,16 +43,13 @@ Incluye un **panel local** (FastAPI) para pausar/reanudar/ejecutar/cancelar/limp
 - **Windows 11**
 - **Python 3.13**
 - **aria2**:
-  - `choco install aria2 -y`, o portable en `tools\aria2\aria2c.exe`.
-- **Telegram**:
-  - Crea un bot con [@BotFather](https://t.me/BotFather) → **BOT_TOKEN**.
-  - Consigue **API_ID** y **API_HASH** en https://my.telegram.org → API Development Tools.
+  ```powershell
+  choco install aria2 -y
 
----
 
-## 🚀 Instalación
+o portable (aria2c.exe) en tools\aria2.
 
-```powershell
+🚀 Instalación
 # 1) Entorno virtual
 py -3.13 -m venv .venv
 .\.venv\Scripts\Activate.ps1
@@ -66,121 +57,128 @@ py -3.13 -m venv .venv
 # 2) Dependencias
 pip install --upgrade pip
 pip install -r requirements.txt
-```
 
-### Variables de entorno (`.env`)
+Variables de entorno (.env)
 
-Crea un archivo `.env` en la raíz:
+Ejemplo:
 
-```ini
 # Telegram
 BOT_TOKEN="123456:ABCDEF..."
 API_ID=123456
 API_HASH="xxxxxxxxxxxxxxxxxxxx"
-TELETHON_STRING="pega_aqui_tu_string_session"  # generar con session_setup.py
 
-# Descargas y panel
+# Sesión de usuario para Telethon
+USE_TELETHON=true
+TELETHON_SESSION_MODE="file"       # "file" o "string"
+TELETHON_STRING=""                 # solo si usas mode=string
+SESSIONS_DIR="./data/sessions"     # para sesiones file
+
+# Descargas y zona horaria
 DOWNLOAD_DIR="./downloads"
-TIMEZONE="America/Chicago"
+TIMEZONE="America/New_York"
+
+# Scheduler
+SCHEDULE_HOUR=3   # hora base (24h)
+# el modo ventana Start/Stop se ajusta desde /schedule
 
 # aria2 RPC
 ARIA2_ENDPOINT="http://127.0.0.1:6800/jsonrpc"
-ARIA2_SECRET=""  # si usas rpc-secret en aria2-config, ponlo aquí
+ARIA2_SECRET="XXXXXXX"
 
-# Panel (opcional)
+# Panel (local)
 PANEL_HOST="127.0.0.1"
 PANEL_PORT=8080
-PANEL_TOKEN="cualquier_string_segura"
-```
+PANEL_TOKEN="XXXXXXX"
 
-Genera **TELETHON_STRING**:
-```powershell
-python .\session_setup.py
-```
+# yt-dlp (opcional)
+YTDLP_COOKIES="./cookies.txt"
+YTDLP_PROXY=""
+YTDLP_FORCE_IPV4=false
+YTDLP_FORMAT="bv*+ba/b"
+YTDLP_MERGE_FORMAT="mp4"
+YTDLP_CONCURRENT_FRAGMENTS=4
+YTDLP_HTTP_CHUNK_SIZE=1048576
+YTDLP_THROTTLED_RATE=1048576
+YTDLP_MAX_RUN_SECS=900
+YTDLP_MAX_PLAYLIST_ITEMS=24
 
----
 
-## ▶️ Ejecución
+Consejo: no publiques .env. Crea variantes (.env.dev, .env.home) si usas varias PCs.
 
-### 1) Inicia **aria2** (RPC)
-```powershell
+▶️ Ejecución
+1) Inicia aria2
 powershell -ExecutionPolicy Bypass -File .\scripts\run-aria2.ps1
-```
-- Usa `scripts\aria2-config.txt` (incluye `enable-rpc=true`).
-- Si defines `rpc-secret`, replica el valor en `.env` (`ARIA2_SECRET`).
 
-### 2) Inicia el **bot** (incluye control local 8765)
-```powershell
-.\.venv\Scripts\Activate.ps1
+2) Inicia el bot (incluye control local 8765)
 python -m tgdl.cli bot
-```
 
-### 3) (Opcional) Inicia el **panel** FastAPI
-```powershell
+3) (Opcional) Inicia el panel FastAPI
 powershell -ExecutionPolicy Bypass -File .\scripts\run-panel.ps1
-```
-Abre `http://127.0.0.1:8080/` (el HTML pedirá `PANEL_TOKEN` para acciones).
 
----
 
-## 💬 Comandos del bot
+Abre http://127.0.0.1:8080/ (UI local).
 
-- `/start` — ayuda general.
-- `/status`, `/list` — estado y cola.
-- `/now` — ejecuta ciclo en segundo plano.
-- `/pause` — pausa global (aria2 + yt-dlp).
-- `/resume` — reanuda y ejecuta ciclo.
-- `/cancel {id}` — cancela trabajo específico.
-- `/clear` — pausa y **borra toda la cola** y progresos.
+💬 Comandos del bot
 
----
+/start, /help, /menu
 
-## 🧲 Magnet y `.torrent`
+/status, /list, /now
 
-- **Magnet**: envía el magnet al chat → se encola y lo toma aria2 (carpeta `downloads/torrents/`).
-- **.torrent (URL)**: pega la URL; el bot descarga el `.torrent` y lo envía a aria2.
-- **.torrent (archivo)**: reenvía el `.torrent` al bot → se pasa a aria2; el `.torrent` local se puede borrar tras enviarlo.
+/pause, /resume
 
----
+/cancel {id}, /clear
 
-## 🗂️ Organización de carpetas
+/retry, /purge
 
-```
+/schedule — activa/desactiva ventana horaria (Start/Stop)
+
+/when HH — cambia hora base
+
+🗂️ Descargas y carpetas
+
+Organización automática por tipo/origen:
+
 downloads/
   torrents/
   youtube/
   example.com/
   Telegram Canal X/
-```
 
----
+🧹 Cancelación y limpieza
 
-## 🧹 Cancelación y limpieza
+Aria2: remove(gid) + borrado de parciales y sidecars (.aria2, *.part, *.ytdl) reportados por tellStatus.files[].path.
 
-- **aria2**: al cancelar, se llama a `remove(gid)` y se consultan los `files` con `tellStatus` para borrar parciales si se desea.
-- **yt-dlp**: al terminar el subproceso por cancelación, se limpian **temporales** (`*.part`, `*.ytdl`) recientes dentro de `DOWNLOAD_DIR`.
+yt-dlp: termina proceso activo y limpia temporales recientes (12h por defecto).
 
----
+🔐 Seguridad
 
-## 🔗 Acortadores de enlaces
+Panel y control HTTP siempre en 127.0.0.1 (no WAN).
 
-- Cuando el destino es soporteable por **yt-dlp**, suele resolver bien redirecciones.  
-- Para **HTTP genérico**, se hace un `HEAD` con `allow_redirects=true`.  
-- Si el acortador usa validaciones anti-bot (JS/Cloudflare) → abre el enlace en navegador y reenvía la URL final.
+No compartas .env ni la DB.
 
----
+Las cabeceras HTTP para MediaFire se pasan a aria2 como header: ["K: V"] (p. ej. Referer).
 
-## 🧰 Troubleshooting
+💾 Backup / Restore
 
-- `ModuleNotFoundError: pydantic_settings` → `pip install pydantic-settings`
-- Panel `401 Unauthorized` en `/` → abre `http://127.0.0.1:8080/` (root sin auth) y usa `PANEL_TOKEN`.
-- Cancel no borra parciales → verifica `ext_id` en DB.
+DB SQLite en .\data\queue.db.
+Backup con el bot apagado:
 
----
+New-Item -ItemType Directory -Force -Path .\backups | Out-Null
+Copy-Item .\data\queue.db .\backups\queue_$(Get-Date -Format yyyyMMdd_HHmmss).db
 
-## 📁 Estructura del proyecto
+🛠️ Desarrollo
 
-```
+Iniciar aria2: .\scripts\run-aria2.ps1
+
+Iniciar bot: python -m tgdl.cli bot
+
+Iniciar panel: .\scripts\run-panel.ps1
+
+Ejecutar tests:
+
+& .\.venv\Scripts\pytest.exe -q
+
+📁 Estructura del proyecto
 tg_super_downloader/
 ├─ tgdl/
 │  ├─ adapters/
@@ -198,35 +196,3 @@ tg_super_downloader/
 ├─ requirements.txt
 ├─ README.md
 └─ .gitignore
-```
-
----
-
-## 🔐 Seguridad (hogar)
-
-- Mantén el panel en `127.0.0.1` y no abras puertos a Internet.
-- No compartas `.env` ni la DB.
-
----
-
-## 💾 Backup / Restore
-
-- DB SQLite en `data/queue.db`.  
-- Copiar con bot apagado:
-  ```powershell
-  Copy-Item .\data\queue.db .\backups\queue_YYYYMMDD.db
-  ```
-
----
-
-## 🛠️ Desarrollo
-
-- **Iniciar aria2**: `powershell -ExecutionPolicy Bypass -File .\scripts\run-aria2.ps1`
-- **Iniciar bot**: `python -m tgdl.cli bot`
-- **Iniciar panel**: `powershell -ExecutionPolicy Bypass -File .\scripts\run-panel.ps1`
-- **Publicar a GitHub**:  
-  ```powershell
-  powershell -ExecutionPolicy Bypass -File .\scripts\publish.ps1 -Message "feat: commit inicial"
-  ```
-
----

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import re
 import secrets
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -122,8 +124,6 @@ def parse_tg_link(url: str):
 
 
 # ========= Telethon helpers (descarga de media TG) =========
-
-
 class PauseSignal(RuntimeError):
     """Señal interna para cortar descargas al pausar el sistema."""
 
@@ -137,6 +137,163 @@ def _progress_cb_factory(qid: int):
         db_update_progress(qid, (t if t > 0 else None), downloaded)
 
     return _cb
+
+
+def _fmt_size(n: int) -> str:
+    try:
+        n = int(n)
+    except Exception:
+        return "0 B"
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    i = 0
+    x = float(n)
+    while x >= 1024.0 and i < len(units) - 1:
+        x /= 1024.0
+        i += 1
+    return f"{x:.1f} {units[i]}"
+
+
+async def _track_aria2_progress(
+    gid: str,
+    chat_id: int,
+    bot,
+    *,
+    every_sec: int | None = None,
+    min_pct_step: int = 10,
+) -> None:
+    """
+    Hace polling a aria2.tellStatus(gid) y envía mensajes al chat con progreso y resultado.
+    - Envía update cada `min_pct_step`% o cada 60s si no hubo cambio suficiente.
+    - Finaliza al llegar a status 'complete' o 'error' o si el GID desaparece.
+    No lanza excepciones; registra y sale silenciosamente ante errores persistentes.
+    """
+    from tgdl.core.logging import logger
+
+    interval = max(5, int(every_sec or int(os.getenv("A2_PROGRESS_EVERY", "20") or "20")))
+    last_pct = -1
+    last_ts = 0.0
+    started = time.time()
+
+    def _pick_file(st: dict) -> tuple[str, int, int]:
+        files = st.get("files") or []
+        name = ""
+        if files:
+            # aria2 suele reportar path completo
+            p = (files[0].get("path") or "").strip()
+            name = Path(p).name or p
+        total = int(st.get("totalLength") or 0)
+        done = int(st.get("completedLength") or 0)
+        return name, total, done
+
+    progress_msg = None
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                st = aria2_tell(gid) or {}
+            except Exception as e:
+                logger.warning("progress aria2_tell failed gid=%s err=%r", gid, e)
+                # sigue intentando; si el GID fue removido, aria2_tell puede fallar o devolver {}
+                st = {}
+
+            status = (st.get("status") or "").lower()
+            name, total, done = _pick_file(st)
+            pct = 0
+            if total > 0:
+                pct = min(100, (done * 100) // total)
+
+            # envío periódico (10% por defecto) o keepalive cada 60s
+            now = time.time()
+            if (pct >= last_pct + min_pct_step) or (now - last_ts >= 60 and status == "active"):
+                # Mensaje único editable para anti-spam
+                txt = (
+                    f"⬇️ Descargando: *{(name or gid)}*\n"
+                    f"{pct}%  ({_fmt_size(done)} / {_fmt_size(total)})"
+                )
+                with contextlib.suppress(Exception):
+                    if progress_msg is None:
+                        progress_msg = await bot.send_message(
+                            chat_id=chat_id, text=txt, parse_mode="Markdown"
+                        )
+                    else:
+                        await bot.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=progress_msg.message_id,
+                            text=txt,
+                            parse_mode="Markdown",
+                        )
+                last_pct = pct
+                last_ts = now
+
+            if status in {"complete", "error", "removed"}:
+                # Mensaje final
+                ico = "✅" if status == "complete" else ("⛔" if status == "removed" else "❌")
+                detail = st.get("errorMessage") or st.get("errorCode") or ""
+                final = (
+                    f"{ico} *{name or gid}*\n"
+                    f"{'Completado' if status == 'complete' else 'Cancelado' if status == 'removed' else 'Error'}"
+                    f"{f' — {detail}' if detail else ''}\n"
+                    f"Tiempo: {int(now - started)}s  Tamaño: {_fmt_size(total)}"
+                )
+                with contextlib.suppress(Exception):
+                    if progress_msg is None:
+                        await bot.send_message(chat_id=chat_id, text=final, parse_mode="Markdown")
+                    else:
+                        await bot.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=progress_msg.message_id,
+                            text=final,
+                            parse_mode="Markdown",
+                        )
+                break
+    except asyncio.CancelledError:
+        # Silencioso si cancelamos el seguimiento (p. ej., /cancel)
+        pass
+    except Exception as e:
+        logger.error("progress tracker crashed gid=%s err=%r", gid, e)
+
+
+async def _await_aria2_and_notify(qid: int, gid: str, notify_chat_id: int | None, bot) -> str:
+    """
+    Espera cooperativamente a que aria2 complete/erroree/sea removido.
+    Actualiza progreso en DB y usa _track_aria2_progress para UX.
+    Retorna el status final ('complete'|'error'|'removed'|'unknown').
+    """
+    status = "unknown"
+    # Lanzar tracker de mensaje editable (sin bloquear) si hay chat
+    tracker = None
+    try:
+        if notify_chat_id:
+            tracker = asyncio.create_task(
+                _track_aria2_progress(gid, notify_chat_id, bot, every_sec=10, min_pct_step=10)
+            )
+        while True:
+            await asyncio.sleep(2)
+            st = {}
+            try:
+                st = aria2_tell(gid) or {}
+            except Exception:
+                st = {}
+            status = (st.get("status") or "").lower()
+            total = int(st.get("totalLength") or 0)
+            done = int(st.get("completedLength") or 0)
+            # Persistimos progreso para el panel
+            try:
+                t = total if total and total >= done else (done or 0)
+                db_update_progress(qid, (t if t > 0 else None), done)
+            except Exception:
+                pass
+            if status in {"complete", "error", "removed"}:
+                break
+            # Cortesía: si no hay status, asumimos removido/cancelado
+            if not status:
+                status = "removed"
+                break
+    finally:
+        if tracker:
+            with contextlib.suppress(Exception):
+                tracker.cancel()
+    return status
 
 
 def _slugify(name: str) -> str:
@@ -380,11 +537,16 @@ def _has_playlistish(u: str) -> tuple[bool, str]:
 
 
 def _mk_playlist_choice_kb(token: str) -> InlineKeyboardMarkup:
+    # Backward-compat: mantenemos 'pl:one'/'pl:all' como "Encolar"
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("▶️ Sólo este video", callback_data=f"pl:one:{token}"),
-                InlineKeyboardButton("📚 Toda la lista", callback_data=f"pl:all:{token}"),
+                InlineKeyboardButton("▶️ Sólo este — Ahora", callback_data=f"pl:one-now:{token}"),
+                InlineKeyboardButton("📚 Lista — Ahora", callback_data=f"pl:all-now:{token}"),
+            ],
+            [
+                InlineKeyboardButton("🕒 Sólo este — Encolar", callback_data=f"pl:one-q:{token}"),
+                InlineKeyboardButton("🕒 Lista — Encolar", callback_data=f"pl:all-q:{token}"),
             ],
             [InlineKeyboardButton("❌ Cancelar", callback_data=f"pl:cancel:{token}")],
         ]
@@ -574,11 +736,15 @@ async def run_cycle(app, force_all: bool = False, notify_chat_id: int | None = N
 
                             gid = aria2_add_torrent(tpath, outdir)
                             db_set_ext_id(qid, gid)
+                            # Esperar finalización aria2 antes de marcar done
+                            final = await _await_aria2_and_notify(
+                                qid, gid, row_notify_chat_id, app.bot
+                            )
+                            ok = final == "complete"
                             try:
                                 tpath.unlink(missing_ok=True)
                             except Exception:
                                 pass
-                            ok = True
 
                         elif "mediafire.com/file/" in low:
                             try:
@@ -586,7 +752,10 @@ async def run_cycle(app, force_all: bool = False, notify_chat_id: int | None = N
                                 if direct and aria2_enabled():
                                     gid = aria2_add(direct, outdir, headers=hdrs)
                                     db_set_ext_id(qid, gid)
-                                    ok = True
+                                    final = await _await_aria2_and_notify(
+                                        qid, gid, row_notify_chat_id, app.bot
+                                    )
+                                    ok = final == "complete"
                                 else:
                                     ok = False
                             except Exception as e:
@@ -737,7 +906,10 @@ async def run_cycle(app, force_all: bool = False, notify_chat_id: int | None = N
                                 try:
                                     gid = aria2_add(url, outdir)
                                     db_set_ext_id(qid, gid)
-                                    ok = True
+                                    final = await _await_aria2_and_notify(
+                                        qid, gid, row_notify_chat_id, app.bot
+                                    )
+                                    ok = final == "complete"
                                 except Exception as e:
                                     print(f"[DBG] aria2 error: {e!r}")
                                     ok = False
@@ -750,15 +922,7 @@ async def run_cycle(app, force_all: bool = False, notify_chat_id: int | None = N
                         )
                         if ok or (not PAUSE_EVT.is_set()):
                             db_clear_progress(qid)
-
-                        if row_notify_chat_id:
-                            try:
-                                await app.bot.send_message(
-                                    chat_id=row_notify_chat_id,
-                                    text=("✅ url lista" if ok else "❌ url falló") + f": {url}",
-                                )
-                            except Exception as e:
-                                print(f"[DBG] notify error: {e!r}")
+                        # Mensaje final ya lo gestiona el tracker editable; no duplicar
 
                     elif kind == "tg_link":
                         url = payload["url"]
@@ -1075,13 +1239,18 @@ async def cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text("Operación cancelada.")
                 return
 
-            allow_playlist = action == "all"
-            # Encolar con flag allow_playlist para yt-dlp
-            scheduled_at = datetime.now(tz=TZ).replace(
-                hour=settings.SCHEDULE_HOUR, minute=0, second=0, microsecond=0
-            )
-            if scheduled_at <= datetime.now(tz=TZ):
-                scheduled_at += timedelta(days=1)
+            allow_playlist = action in ("all", "all-q", "all-now")
+            run_now = action.endswith("-now")
+
+            # Programación
+            if run_now:
+                scheduled_at = datetime.now(tz=TZ) - timedelta(minutes=1)
+            else:
+                scheduled_at = datetime.now(tz=TZ).replace(
+                    hour=settings.SCHEDULE_HOUR, minute=0, second=0, microsecond=0
+                )
+                if scheduled_at <= datetime.now(tz=TZ):
+                    scheduled_at += timedelta(days=1)
 
             db_add(
                 "url",
@@ -1094,7 +1263,7 @@ async def cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
             # Mensaje UX: guía siguiente paso
-            # ¿24/7 o ventana?
+
             is_always = db_get_flag("SCHED_ENABLED", "1") == "0"
             rows = db_list(limit=9999)  # rápido, para contar
             qcount = len(rows) if rows else 1
@@ -1116,6 +1285,25 @@ async def cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 + f"\nTienes {qcount} elemento(s) en cola.\n"
                 + hint
             )
+            if run_now:
+                # Lanzar ciclo inmediato
+                try:
+                    asyncio.create_task(
+                        launch_cycle_background(
+                            context.application,
+                            force_all=True,
+                            notify_chat_id=query.message.chat_id,
+                        )
+                    )
+                except Exception:
+                    pass
+        elif data in ("pl:one", "pl:all"):
+            # Backward-compat: tratar como '...-q'
+            suffix = "-q"
+            new = data.replace("pl:", "pl:") + suffix
+            # Reinvocar manejador con el nuevo action
+            query.data = new
+            await cb_router(update, context)
         else:
             await query.edit_message_text(
                 "🤔 Acción no reconocida.", reply_markup=mk_main_menu(is_paused())
@@ -1411,15 +1599,30 @@ async def intake(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for u in urls:
         is_pl, kind = _has_playlistish(u)
         if _is_youtube(u) and is_pl:
-            # Preguntar al usuario: vídeo único o lista completa
+            # Pre-vista de la lista antes de decidir
             token = secrets.token_hex(8)
             PLAYLIST_CHOICES[token] = u
             label = "lista (Radio)" if kind == "radio" else "lista"
-            await m.reply_text(
-                f"Detecté un enlace de YouTube con {label}. ¿Qué deseas descargar?",
-                reply_markup=_mk_playlist_choice_kb(token),
-                disable_web_page_preview=True,
-            )
+            try:
+                limit = _get_playlist_limit()
+                meta = await ytdlp.probe_playlist(u, limit=limit)
+                title = meta.get("title") or "Playlist"
+                sample = meta.get("sample") or []
+                lines = [f"📚 <b>{title}</b> — {len(sample)} de {meta.get('count') or '?'} ítems:"]
+                for s in sample:
+                    lines.append(f"• #{s.get('index', '?')} — {s.get('title', '(sin título)')}")
+                await m.reply_text(
+                    "\n".join(lines),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=_mk_playlist_choice_kb(token),
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                await m.reply_text(
+                    f"Detecté un enlace de YouTube con {label}. ¿Qué deseas descargar?",
+                    reply_markup=_mk_playlist_choice_kb(token),
+                    disable_web_page_preview=True,
+                )
             # No encolamos todavía este enlace. Pasamos al siguiente (si lo hubiera).
             continue
 

@@ -131,8 +131,10 @@ def aria2_enabled() -> bool:
 
 
 def add_uri(url: str, outdir: Path, headers: dict[str, str] | None = None) -> str:
-    """Añade una URL (http/https/magnet) y devuelve el GID."""
-    opts: dict[str, Any] = {}
+    """Añade una URL (http/https/magnet) y devuelve el GID.
+    Nota: Forzamos seed-time=0 para evitar seeding tras completar (BT)."""
+
+    opts: dict[str, Any] = {"seed-time": "0"}  # evita seeding en BitTorrent
     if headers:
         # aria2 espera lista de strings "K: V"
         hdr_list = [f"{k}: {v}" for k, v in headers.items() if k and v is not None]
@@ -142,8 +144,9 @@ def add_uri(url: str, outdir: Path, headers: dict[str, str] | None = None) -> st
 
 
 def add_torrent(torrent_path: Path, outdir: Path) -> str:
-    """Añade un archivo .torrent y devuelve el GID."""
-    return ARIA2.add_torrent(torrent_path, outdir=outdir, options=None)
+    """Añade un archivo .torrent y devuelve el GID.
+    Nota: seed-time=0 para no seedear tras finalizar."""
+    return ARIA2.add_torrent(torrent_path, outdir=outdir, options={"seed-time": "0"})
 
 
 def pause_all() -> Any:

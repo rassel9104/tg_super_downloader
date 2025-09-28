@@ -23,3 +23,7 @@ rpc-secret=D0wnl04d3r
 
 # SSL
 check-certificate=false
+
+# --- BitTorrent / No seed tras completar ---
+seed-time=0
+# (No usar seed-ratio=0.0: eso implica seed ilimitado, ver manpage)

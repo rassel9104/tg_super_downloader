@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     TIMEZONE: str = "America/New_York"
 
     # Scheduler
-    SCHEDULE_HOUR: int = 3
+    SCHEDULE_HOUR: int = 24 / 7  # 0-23 o 24/7 para siempre activo
 
     # aria2
     ARIA2_ENDPOINT: str = "http://127.0.0.1:6800/jsonrpc"
@@ -62,14 +62,29 @@ AUTORUN_ON_INTAKE: bool = os.getenv("AUTORUN_ON_INTAKE", "0").strip() == "1"
 # --- Throttle de progreso en Telegram ---
 # Editar mensaje cuando el % sube al menos este paso (por defecto 15)
 try:
-    PROGRESS_MIN_PCT_STEP: int = max(1, int(os.getenv("PROGRESS_MIN_PCT_STEP", "15")))
+    PROGRESS_MIN_PCT_STEP: int = max(1, int(os.getenv("PROGRESS_MIN_PCT_STEP", "20")))
 except Exception:
-    PROGRESS_MIN_PCT_STEP = 15
+    PROGRESS_MIN_PCT_STEP = 20
 
 # Enviar keep-alive si no hubo salto de % en este tiempo (segundos; por defecto 120)
 try:
-    PROGRESS_KEEPALIVE_SEC: int = max(30, int(os.getenv("PROGRESS_KEEPALIVE_SEC", "120")))
+    PROGRESS_KEEPALIVE_SEC: int = max(30, int(os.getenv("PROGRESS_KEEPALIVE_SEC", "180")))
 except Exception:
-    PROGRESS_KEEPALIVE_SEC = 120
+    PROGRESS_KEEPALIVE_SEC = 180
+
+
+# --- Notificador global de progreso (resumen) ---
+# 0 = deshabilitado (recomendado); 1 = habilitado
+PROGRESS_SUMMARY_ENABLE: bool = os.getenv("PROGRESS_SUMMARY_ENABLE", "0").strip() == "1"
+# intervalo del loop del resumen (segundos)
+try:
+    PROGRESS_SUMMARY_EVERY: int = max(20, int(os.getenv("PROGRESS_SUMMARY_EVERY", "120")))
+except Exception:
+    PROGRESS_SUMMARY_EVERY = 90
+# separación mínima por ítem entre apariciones en el resumen (segundos)
+try:
+    PROGRESS_SUMMARY_MIN_SEP: int = max(45, int(os.getenv("PROGRESS_SUMMARY_MIN_SEP", "150")))
+except Exception:
+    PROGRESS_SUMMARY_MIN_SEP = 210
 
 settings = Settings()

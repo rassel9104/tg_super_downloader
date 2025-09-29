@@ -655,6 +655,7 @@ async def launch_cycle_background(app, force_all: bool = False, notify_chat_id: 
 
 async def _progress_notifier(app, chat_id, stop_evt: asyncio.Event):
     last_sent: dict[int, float] = {}
+    summary_msg = None  # mensaje único editable
     while not stop_evt.is_set():
         rows = db_get_progress_rows(50)
         now = asyncio.get_event_loop().time()
@@ -666,24 +667,41 @@ async def _progress_notifier(app, chat_id, stop_evt: asyncio.Event):
             done = r.get("downloaded") or 0
             if total <= 0 or done <= 0:
                 continue
-            if (now - last_sent.get(qid, 0)) < 12:
+            # separar por ítem usando settings
+            if (now - last_sent.get(qid, 0)) < settings.PROGRESS_SUMMARY_MIN_SEP:
                 continue
             last_sent[qid] = now
-            pct = done / total * 100.0
-            lines.append(
-                f"#{qid} {pct:.1f}%  {done / 1024 / 1024:.1f}MB / {total / 1024 / 1024:.1f}MB"
-            )
+            name = r.get("name") or r.get("filename") or f"#{qid}"
+            pct = 0
+            if total > 0:
+                pct = min(100, (int(done) * 100) // int(total))
+            line = f"• *{name}* — {pct}%  ({_fmt_size(int(done))} / {_fmt_size(int(total))})"
+            lines.append(line)
             count += 1
             if count >= 5:
                 break
         if lines:
             try:
-                await app.bot.send_message(
-                    chat_id=chat_id, text="⏳ Progreso:\n" + "\n".join(lines)
-                )
+                text = "⬇️ Descargando:\n" + "\n".join(lines)
+                if summary_msg is None:
+                    summary_msg = await app.bot.send_message(
+                        chat_id=chat_id,
+                        text=text,
+                        parse_mode=ParseMode.MARKDOWN,
+                        disable_web_page_preview=True,
+                    )
+                else:
+                    await app.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=summary_msg.message_id,
+                        text=text,
+                        parse_mode=ParseMode.MARKDOWN,
+                        disable_web_page_preview=True,
+                    )
             except Exception as e:
                 print(f"[DBG] notify progress error: {e!r}")
-        await asyncio.sleep(3)
+        # loop controlado por settings
+        await asyncio.sleep(settings.PROGRESS_SUMMARY_EVERY)
 
 
 async def run_cycle(app, force_all: bool = False, notify_chat_id: int | None = None):
@@ -702,7 +720,8 @@ async def run_cycle(app, force_all: bool = False, notify_chat_id: int | None = N
 
     notify_stop_evt = asyncio.Event()
     notifier_task = None
-    if notify_chat_id:
+    # El resumen global es opcional (por defecto deshabilitado)
+    if notify_chat_id and settings.PROGRESS_SUMMARY_ENABLE:
         notifier_task = asyncio.create_task(
             _progress_notifier(app, notify_chat_id, notify_stop_evt)
         )

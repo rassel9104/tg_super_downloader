@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from typing import Literal
 
@@ -54,5 +55,21 @@ class Settings(BaseSettings):
 
     LOG_LEVEL: str = "INFO"
 
+
+# --- Control de arranque de ciclo al encolar (por defecto: NO) ---
+AUTORUN_ON_INTAKE: bool = os.getenv("AUTORUN_ON_INTAKE", "0").strip() == "1"
+
+# --- Throttle de progreso en Telegram ---
+# Editar mensaje cuando el % sube al menos este paso (por defecto 15)
+try:
+    PROGRESS_MIN_PCT_STEP: int = max(1, int(os.getenv("PROGRESS_MIN_PCT_STEP", "15")))
+except Exception:
+    PROGRESS_MIN_PCT_STEP = 15
+
+# Enviar keep-alive si no hubo salto de % en este tiempo (segundos; por defecto 120)
+try:
+    PROGRESS_KEEPALIVE_SEC: int = max(30, int(os.getenv("PROGRESS_KEEPALIVE_SEC", "120")))
+except Exception:
+    PROGRESS_KEEPALIVE_SEC = 120
 
 settings = Settings()

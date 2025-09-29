@@ -162,7 +162,7 @@ async def _track_aria2_progress(
     bot,
     *,
     every_sec: int | None = None,
-    min_pct_step: int = 10,
+    min_pct_step: int | None = None,
 ) -> None:
     """
     Hace polling a aria2.tellStatus(gid) y envía mensajes al chat con progreso y resultado.
@@ -172,10 +172,29 @@ async def _track_aria2_progress(
     """
     from tgdl.core.logging import logger
 
-    interval = max(5, int(every_sec or int(os.getenv("A2_PROGRESS_EVERY", "20") or "20")))
+    # Si no se pasa cada cuánto sondear, usa A2_PROGRESS_EVERY (s por defecto 20)
+    interval = max(
+        5,
+        int(
+            every_sec
+            if every_sec is not None
+            else int(os.getenv("A2_PROGRESS_EVERY", "120") or "120")
+        ),
+    )
+    # Paso mínimo de % para editar (por defecto desde .env o 15)
+    if min_pct_step is None:
+        try:
+            min_pct_step = max(1, int(os.getenv("A2_PROGRESS_STEP", "20")))
+        except Exception:
+            min_pct_step = 20
     last_pct = -1
     last_ts = 0.0
     started = time.time()
+    # Keepalive si no hubo salto de % en N segundos (por defecto 120)
+    try:
+        keepalive = max(30, int(os.getenv("A2_PROGRESS_KEEPALIVE", "120")))
+    except Exception:
+        keepalive = 180
 
     def _pick_file(st: dict) -> tuple[str, int, int]:
         files = st.get("files") or []
@@ -207,7 +226,9 @@ async def _track_aria2_progress(
 
             # envío periódico (10% por defecto) o keepalive cada 60s
             now = time.time()
-            if (pct >= last_pct + min_pct_step) or (now - last_ts >= 60 and status == "active"):
+            if (pct >= last_pct + min_pct_step) or (
+                now - last_ts >= keepalive and status == "active"
+            ):
                 # Mensaje único editable para anti-spam
                 txt = (
                     f"⬇️ Descargando: *{(name or gid)}*\n"
@@ -267,8 +288,9 @@ async def _await_aria2_and_notify(qid: int, gid: str, notify_chat_id: int | None
     tracker = None
     try:
         if notify_chat_id:
+            # Dejamos que _track_aria2_progress lea los valores desde .env
             tracker = asyncio.create_task(
-                _track_aria2_progress(gid, notify_chat_id, bot, every_sec=10, min_pct_step=10)
+                _track_aria2_progress(gid, notify_chat_id, bot, every_sec=None, min_pct_step=None)
             )
         while True:
             await asyncio.sleep(2)

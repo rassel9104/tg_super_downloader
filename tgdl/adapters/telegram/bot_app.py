@@ -237,14 +237,18 @@ async def _track_aria2_progress(
                 with contextlib.suppress(Exception):
                     if progress_msg is None:
                         progress_msg = await bot.send_message(
-                            chat_id=chat_id, text=txt, parse_mode="Markdown"
+                            chat_id=chat_id,
+                            text=txt,
+                            parse_mode=ParseMode.MARKDOWN,
+                            disable_web_page_preview=True,
                         )
                     else:
                         await bot.edit_message_text(
                             chat_id=chat_id,
                             message_id=progress_msg.message_id,
                             text=txt,
-                            parse_mode="Markdown",
+                            parse_mode=ParseMode.MARKDOWN,
+                            disable_web_page_preview=True,
                         )
                 last_pct = pct
                 last_ts = now
@@ -259,17 +263,27 @@ async def _track_aria2_progress(
                     f"{f' — {detail}' if detail else ''}\n"
                     f"Tiempo: {int(now - started)}s  Tamaño: {_fmt_size(total)}"
                 )
-                with contextlib.suppress(Exception):
+                try:
                     if progress_msg is None:
-                        await bot.send_message(chat_id=chat_id, text=final, parse_mode="Markdown")
+                        # Fallback: no hubo mensaje de progreso previo → crear el mensaje final
+                        await bot.send_message(
+                            chat_id=chat_id,
+                            text=final,
+                            parse_mode=ParseMode.MARKDOWN,
+                            disable_web_page_preview=True,
+                        )
                     else:
+                        # Hubo progreso previo → editar el mismo mensaje
                         await bot.edit_message_text(
                             chat_id=chat_id,
                             message_id=progress_msg.message_id,
                             text=final,
-                            parse_mode="Markdown",
+                            parse_mode=ParseMode.MARKDOWN,
+                            disable_web_page_preview=True,
                         )
-                break
+                except Exception as _e:
+                    logger.warning("final notify failed: %r", _e)
+            break
     except asyncio.CancelledError:
         # Silencioso si cancelamos el seguimiento (p. ej., /cancel)
         pass

@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import re
+from html import unescape
 from urllib.parse import urlparse
 
 import httpx
@@ -79,9 +79,11 @@ def extract_mediafire_direct_link(html: str) -> str | None:
 
 async def resolve_sourceforge_direct(url: str) -> tuple[str | None, dict[str, str] | None]:
     """
-    Resuelve un enlace de SourceForge (típicamente termina en /download) a la URL final
-    del mirror (p. ej. *.dl.sourceforge.net). No descarga el binario, solo sigue redirecciones.
-    Retorna (direct_url, headers) o (None, None).
+    Resuelve un enlace de SourceForge (típicamente /download) a una URL directa del mirror:
+    - Intenta redirecciones (follow_redirects=True).
+    - Si devuelve HTML, parsea <a id="direct-download"> o <meta refresh>.
+    - Como último recurso, construye https://downloads.sourceforge.net/project/<proj>/<path>.
+    Retorna (direct_url, headers) o (None, None) si no fue posible.
     """
     try:
         host = (urlparse(url).hostname or "").lower()
@@ -105,12 +107,56 @@ async def resolve_sourceforge_direct(url: str) -> tuple[str | None, dict[str, st
     try:
         async with asyncio.timeout(30.0):
             async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as cli:
-                resp = await cli.get(req_url, headers=headers, stream=True)
+                # 1) Intento normal (sigue 302 a downloads.* si lo hay)
+                resp = await cli.get(req_url, headers=headers)
                 direct = str(resp.url) if resp is not None else None
-                with contextlib.suppress(Exception):
-                    await resp.aclose()
-        if not direct:
-            return None, None
-        return direct, headers
+                ctype = resp.headers.get("content-type", "")
+                text = resp.text if ("text/html" in ctype.lower()) else ""
+                # Si caímos en HTML en sourceforge.net, parsear href/meta refresh
+                if direct and "sourceforge.net" in urlparse(direct).hostname.lower():
+                    if text:
+                        html = unescape(text)
+                        # a) <a id="direct-download" href="...">
+                        m = re.search(
+                            r'id=["\']direct-download["\']\s+href=["\']([^"\']+)["\']',
+                            html,
+                            re.IGNORECASE,
+                        )
+                        if m:
+                            return m.group(1), headers
+                        # b) <meta http-equiv="refresh" content="0; url=...">
+                        m2 = re.search(
+                            r'http-equiv=["\']refresh["\']\s+content=["\'][^;]+;\s*url=([^"\']+)["\']',
+                            html,
+                            re.IGNORECASE,
+                        )
+                        if m2:
+                            return m2.group(1), headers
+                        # c) cualquier downloads.* en un href
+                        m3 = re.search(
+                            r'href=["\'](https?://(?:downloads|[a-z0-9\-]+\.dl)\.sourceforge\.net/[^"\']+)["\']',
+                            html,
+                            re.IGNORECASE,
+                        )
+                        if m3:
+                            return m3.group(1), headers
+                    # 2) Construcción directa por patrón /projects/<proj>/files/<path>/download
+                    m4 = re.search(
+                        r"https?://sourceforge\.net/projects/([^/]+)/files/(.+)/download",
+                        req_url,
+                        re.IGNORECASE,
+                    )
+                    if m4:
+                        proj = m4.group(1)
+                        rest = m4.group(2)
+                        built = f"https://downloads.sourceforge.net/project/{proj}/{rest}"
+                        return built, headers
+                # Caso feliz: ya estamos en downloads.* o *.dl.*
+                if direct and any(
+                    x in (urlparse(direct).hostname or "").lower()
+                    for x in ("downloads.sourceforge.net", ".dl.sourceforge.net")
+                ):
+                    return direct, headers
+        return None, None
     except Exception:
         return None, None

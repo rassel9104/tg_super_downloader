@@ -776,34 +776,25 @@ async def run_cycle(app, force_all: bool = False, notify_chat_id: int | None = N
                         elif "sourceforge.net/" in low:
                             try:
                                 direct, hdrs = await resolve_sourceforge_direct(url)
-                                if aria2_enabled():
-                                    # Fallback si el resolver no entregó URL directa
-                                    target = direct or (
-                                        url
-                                        if low.endswith("/download")
-                                        else (url.rstrip("/") + "/download")
-                                    )
-                                    if not hdrs:
-                                        hdrs = {
-                                            "Referer": url,
-                                            "User-Agent": (
-                                                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-                                            ),
-                                            "Accept": "*/*",
-                                        }
-                                    gid = aria2_add(target, outdir, headers=hdrs)
-                                    db_set_ext_id(qid, gid)
-                                    # Espera cooperativa hasta completar (como MediaFire)
-                                    final = await _await_aria2_and_notify(
-                                        qid, gid, row_notify_chat_id, app.bot
-                                    )
-                                    ok = final == "complete"
-                                else:
+                                if not aria2_enabled():
                                     print(
                                         "[DBG] SourceForge: aria2_enabled()=False. Revisa RPC URL/secret/estado de aria2."
                                     )
                                     ok = False
+                                else:
+                                    # Si no hubo 'direct', el resolver ya habrá intentado construir uno.
+                                    if not direct:
+                                        print(
+                                            "[DBG] SF resolver no obtuvo URL directa. Abortando este ítem para evitar descargar HTML."
+                                        )
+                                        ok = False
+                                    else:
+                                        gid = aria2_add(direct, outdir, headers=hdrs)
+                                        db_set_ext_id(qid, gid)
+                                        final = await _await_aria2_and_notify(
+                                            qid, gid, row_notify_chat_id, app.bot
+                                        )
+                                        ok = final == "complete"
                             except Exception as e:
                                 print(f"[DBG] sourceforge error: {e!r}")
                                 ok = False
@@ -1587,7 +1578,11 @@ async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.application, force_all=True, notify_chat_id=update.effective_chat.id
     )
     if started:
-        await update.message.reply_text("🚀 Ciclo lanzado en segundo plano. Te aviso al finalizar.")
+        msg = update.effective_message
+
+    if msg:
+        with contextlib.suppress(Exception):
+            await msg.reply_text("🚀 Ciclo lanzado en segundo plano. Te aviso al finalizar.")
     else:
         await update.message.reply_text("⚠️ Ya hay un ciclo ejecutándose.")
 

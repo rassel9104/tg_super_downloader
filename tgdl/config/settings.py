@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     TIMEZONE: str = "America/New_York"
 
     # Scheduler
-    SCHEDULE_HOUR: int = 24 / 7  # 0-23 o 24/7 para siempre activo
+    SCHEDULE_HOUR: int = 0  # 0-23 o 24/7 para siempre activo
 
     # aria2
     ARIA2_ENDPOINT: str = "http://127.0.0.1:6800/jsonrpc"

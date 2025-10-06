@@ -522,12 +522,14 @@ def mk_when_menu() -> InlineKeyboardMarkup:
 
 def fmt_start_message_html() -> str:
     return (
-        "👋 <b>TG Super Downloader</b>\n"
-        "Descargas desde Telegram, YouTube y enlaces directos. Envíame:\n"
+        "👋 <b>AssistDown</b>\n"
+        "Descargas desde Telegram, YouTube, SourceForge, enlaces directos y mucho más\n."
+        "Envíame:\n"
         "• Links de Telegram (<code>https://t.me/...</code>)\n"
         "• URLs http/https/magnet\n"
-        "• Medios reenviados (video/audio/documento)\n\n"
-        "ℹ️ Comparte un enlace; si es una lista de YouTube te preguntaré si quieres sólo el video o la lista completa.\n\n"
+        "• Medios reenviados (video/audio/documento)\n"
+        "• Cualquier enlace de tu elección\n\n"
+        "ℹ️ Si es una lista de YouTube te preguntaré si quieres sólo el video o la lista completa.\n\n"
         f"⏰ Programado diario a las <b>{settings.SCHEDULE_HOUR:02d}:00</b> (<code>{settings.TIMEZONE}</code>).\n"
         "Usa los botones para control rápido o /help."
     )
@@ -771,11 +773,11 @@ async def run_cycle(app, force_all: bool = False, notify_chat_id: int | None = N
                         ok = False
                         outdir = pick_outdir("url", payload, outdir_base)
                         await asyncio.sleep(0)  # cede el control al loop
-                        if "mega.nz/" in low:
-                            print("[URL] MEGA no soportado en este proyecto.")
-                            ok = False
+                        # if "mega.nz/" in low:
+                        #    print("[URL] MEGA no soportado en este proyecto.")
+                        #    ok = False
 
-                        elif low.endswith(".torrent"):
+                        if low.endswith(".torrent"):
                             # Descarga el .torrent a temp y envíalo a aria2
                             import tempfile
 

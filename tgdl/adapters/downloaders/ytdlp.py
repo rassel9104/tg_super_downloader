@@ -5,6 +5,7 @@ import contextlib
 import os
 import re
 import shutil
+import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -111,6 +112,18 @@ def _common_args(
         "postprocess:%(progress._percent_str)s post",
         "--no-warnings",
     ]
+    # --- Subtítulos (español / auto) ---
+    if getattr(settings, "YTDLP_WRITE_SUBS", False):
+        sub_langs = getattr(settings, "YTDLP_SUB_LANGS", "es,*")
+        args += ["--write-subs", "--write-auto-subs", "--sub-langs", sub_langs]
+        conv = (getattr(settings, "YTDLP_CONVERT_SUBS", "srt") or "").strip()
+        if conv:
+            args += ["--convert-subs", conv]
+    # --- Metadata/thumbnail ---
+    if getattr(settings, "YTDLP_METADATA_NFO", True):
+        args += ["--write-info-json"]
+    if getattr(settings, "YTDLP_WRITE_THUMB", True):
+        args += ["--write-thumbnail", "--convert-thumbnails", "jpg"]
 
     if not allow_playlist:
         args.append("--no-playlist")
@@ -427,6 +440,10 @@ async def download_proc(
         logger.warning("[YTDLP][retry] rc!=0; reintentando SIN cookies como fallback…")
     ok2, lines2 = await _run(use_cookies=False)
     if ok2:
+        # Post-proceso: generar NFO si está habilitado
+        if getattr(settings, "YTDLP_METADATA_NFO", True):
+            with contextlib.suppress(Exception):
+                _emit_nfo_for_recent(outdir)
         return True
 
     # Tail final si también falla sin cookies
@@ -434,3 +451,66 @@ async def download_proc(
     tail = tail[-40:] if len(tail) > 40 else tail
     logger.error("[YTDLP][fail] sin cookies también falló. Tail=%s", "\n".join(tail))
     return False
+
+
+# ================= NFO helpers =================
+
+
+def _iso_date_from_upload(s: str | None) -> str:
+    # yt-dlp upload_date -> "YYYYMMDD"
+    if not s or len(s) < 8:
+        return ""
+    y, m, d = s[:4], s[4:6], s[6:8]
+    return f"{y}-{m}-{d}"
+
+
+def _write_nfo_from_info_json(info_json_path: Path) -> None:
+    with info_json_path.open("r", encoding="utf-8") as f:
+        info = __import__("json").load(f)
+
+    title = info.get("title") or info.get("fulltitle") or ""
+    fulltitle = info.get("fulltitle") or title
+    plot = info.get("description") or ""
+    duration = int(info.get("duration") or 0)
+    uploader = info.get("uploader") or info.get("channel") or ""
+    upload_date = _iso_date_from_upload(info.get("upload_date"))
+    uid = info.get("id") or ""
+    thumb = None
+    # yt-dlp guarda .jpg al lado del media (con outtmpl). Si hay "thumbnails" en JSON, usamos la mayor
+    thumbs = info.get("thumbnails") or []
+    if isinstance(thumbs, list) and thumbs:
+        thumbs_sorted = sorted(thumbs, key=lambda t: (t.get("height") or 0), reverse=True)
+        thumb = thumbs_sorted[0].get("url")
+
+    root = ET.Element("movie")
+    ET.SubElement(root, "title").text = title
+    ET.SubElement(root, "originaltitle").text = fulltitle
+    ET.SubElement(root, "plot").text = plot
+    if duration > 0:
+        ET.SubElement(root, "runtime").text = str(max(1, duration // 60))
+    if upload_date:
+        ET.SubElement(root, "aired").text = upload_date
+    if uploader:
+        ET.SubElement(root, "studio").text = uploader
+    uid_el = ET.SubElement(root, "uniqueid")
+    uid_el.set("type", "youtube")
+    uid_el.text = uid
+    if thumb:
+        ET.SubElement(root, "thumb").text = thumb
+
+    nfo_path = info_json_path.with_suffix(".nfo")
+    ET.ElementTree(root).write(nfo_path, encoding="utf-8", xml_declaration=True)
+
+
+def _emit_nfo_for_recent(outdir: Path) -> int:
+    """
+    Recorre *.info.json y emite .nfo para cada uno que no exista.
+    Devuelve cuántos NFO se generaron.
+    """
+    n = 0
+    for j in outdir.glob("*.info.json"):
+        nfo = j.with_suffix(".nfo")
+        if not nfo.exists():
+            _write_nfo_from_info_json(j)
+            n += 1
+    return n

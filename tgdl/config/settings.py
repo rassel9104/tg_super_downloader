@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 from pathlib import Path
 from typing import Literal
@@ -83,6 +85,38 @@ class Settings(BaseSettings):
         PROGRESS_SUMMARY_MIN_SEP: int = max(45, int(os.getenv("PROGRESS_SUMMARY_MIN_SEP", "150")))
     except Exception:
         PROGRESS_SUMMARY_MIN_SEP = 210
+
+    # --- yt-dlp: subtítulos y metadata ---
+    try:
+        YTDLP_WRITE_SUBS: bool = os.getenv("YTDLP_WRITE_SUBS", "1").strip().lower() in ("1", "true")
+    except Exception:
+        YTDLP_WRITE_SUBS = True
+    # Lista separada por comas; admite comodines. Ej.: "es,es-419,es-ES"
+    try:
+        YTDLP_SUB_LANGS: str = os.getenv("YTDLP_SUB_LANGS", "es,es-419,es-ES")
+    except Exception:
+        YTDLP_SUB_LANGS = "es,es-419,es-ES"
+    # Convertir subtítulos a formato objetivo. Vacío para desactivar (por defecto srt)
+    try:
+        YTDLP_CONVERT_SUBS: str = os.getenv("YTDLP_CONVERT_SUBS", "srt").strip()
+    except Exception:
+        YTDLP_CONVERT_SUBS = "srt"
+    # Escribir info.json y .nfo (Emby/Jellyfin)
+    try:
+        YTDLP_METADATA_NFO: bool = os.getenv("YTDLP_METADATA_NFO", "1").strip().lower() in (
+            "1",
+            "true",
+        )
+    except Exception:
+        YTDLP_METADATA_NFO = True
+    # Escribir y convertir miniatura a .jpg
+    try:
+        YTDLP_WRITE_THUMB: bool = os.getenv("YTDLP_WRITE_THUMB", "1").strip().lower() in (
+            "1",
+            "true",
+        )
+    except Exception:
+        YTDLP_WRITE_THUMB = True
 
 
 settings = Settings()

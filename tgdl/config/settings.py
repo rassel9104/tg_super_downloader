@@ -118,5 +118,29 @@ class Settings(BaseSettings):
     except Exception:
         YTDLP_WRITE_THUMB = True
 
+    # --- yt-dlp: cookies / autenticación (YouTube) ---
+    # Modo: 'browser' (recomendado), 'file', 'off' o 'auto'
+    try:
+        YTDLP_COOKIES_MODE: str = os.getenv("YTDLP_COOKIES_MODE", "browser").strip().lower()
+    except Exception:
+        YTDLP_COOKIES_MODE = "browser"
+    # Navegador para --cookies-from-browser: edge|chrome|firefox|brave|opera|vivaldi|chromium
+    try:
+        YTDLP_BROWSER: str = os.getenv("YTDLP_BROWSER", "edge").strip()
+    except Exception:
+        YTDLP_BROWSER = "edge"
+    # Perfil del navegador (Edge/Chrome: 'Default' suele ser el correcto)
+    try:
+        YTDLP_BROWSER_PROFILE: str = os.getenv("YTDLP_BROWSER_PROFILE", "Default").strip()
+    except Exception:
+        YTDLP_BROWSER_PROFILE = "Default"
+    # Ruta a cookies en formato Netscape si usas modo 'file'
+    try:
+        YTDLP_COOKIES_FILE: str = os.getenv(
+            "YTDLP_COOKIES_FILE", r"data\cookies\youtube.txt"
+        ).strip()
+    except Exception:
+        YTDLP_COOKIES_FILE = r"data\cookies\youtube.txt"
+
 
 settings = Settings()

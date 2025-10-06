@@ -112,10 +112,25 @@ def _common_args(
         "postprocess:%(progress._percent_str)s post",
         "--no-warnings",
     ]
+    # --- Cookies / autenticación (YouTube) ---
+    if use_cookies:
+        args += _cookies_args()
     # --- Subtítulos (español / auto) ---
     if getattr(settings, "YTDLP_WRITE_SUBS", False):
-        sub_langs = getattr(settings, "YTDLP_SUB_LANGS", "es,*")
-        args += ["--write-subs", "--write-auto-subs", "--sub-langs", sub_langs]
+        # Saneamos lista de lenguas
+        raw = (
+            (getattr(settings, "YTDLP_SUB_LANGS", "es,es-419,es-ES") or "")
+            .strip()
+            .strip('"')
+            .strip("'")
+        )
+        codes = [c.strip() for c in raw.split(",") if c.strip()]
+        if len(codes) == 1 and codes[0] in {"*", "all"}:
+            sub_arg = "all"
+        else:
+            codes = [c for c in codes if c != "*"]
+            sub_arg = ",".join(codes) if codes else "es,es-419,es-ES"
+        args += ["--write-subs", "--write-auto-subs", "--sub-langs", sub_arg]
         conv = (getattr(settings, "YTDLP_CONVERT_SUBS", "srt") or "").strip()
         if conv:
             args += ["--convert-subs", conv]
@@ -149,6 +164,54 @@ def _common_args(
 
     args.append(url)
     return args
+
+
+# ================= outtmpl helper =================
+def _default_outtmpl(outdir: Path) -> str:
+    """
+    Plantilla de salida por defecto para yt-dlp.
+    Usamos un nombre Windows-safe y dejamos que yt-dlp gestione el slug del título.
+    """
+    return str(outdir / "%(title).200B [%(id)s].%(ext)s")
+
+
+# ================= Cookies helpers =================
+def _cookies_args() -> list[str]:
+    """
+    Construye flags de cookies para yt-dlp según settings.
+    Prioridad:
+      - browser: --cookies-from-browser <browser>:<profile>
+      - file (si existe): --cookies <path>
+      - off: sin cookies
+      - auto: browser si YTDLP_BROWSER está definido; si no, file si existe; si no, off
+    """
+    mode = (getattr(settings, "YTDLP_COOKIES_MODE", "browser") or "browser").lower()
+    browser = (getattr(settings, "YTDLP_BROWSER", "edge") or "edge").lower()
+    profile = getattr(settings, "YTDLP_BROWSER_PROFILE", "Default") or "Default"
+    cookie_file = (
+        getattr(settings, "YTDLP_COOKIES_FILE", r"data\cookies\youtube.txt")
+        or "data\cookies\youtube.txt"
+    )
+
+    def _browser_args():
+        # FORMATO: --cookies-from-browser edge:Default
+        return ["--cookies-from-browser", f"{browser}:{profile}"]
+
+    def _file_args():
+        return ["--cookies", cookie_file]
+
+    if mode == "browser":
+        return _browser_args()
+    if mode == "file":
+        return _file_args() if os.path.exists(cookie_file) else []
+    if mode == "off":
+        return []
+    # auto
+    if browser:
+        return _browser_args()
+    if os.path.exists(cookie_file):
+        return _file_args()
+    return []
 
 
 # --- NUEVO  ---
@@ -428,12 +491,12 @@ async def download_proc(
                 proc.kill()
             return False, lines
 
-    # 1º intento con cookies (si existen)
-    ok, lines = await _run(use_cookies=True)
-    if ok:
+    # 1) con cookies (si procede)
+    ok1, lines = await _run(use_cookies=True)
+    if ok1:
         return True
 
-    # 2º intento sin cookies (fallback genérico)
+    # 2) sin cookies (fallback)
     if _looks_403(lines):
         logger.warning("[YTDLP][retry] 403 detectado; reintentando SIN cookies…")
     else:

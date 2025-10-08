@@ -142,5 +142,20 @@ class Settings(BaseSettings):
     except Exception:
         YTDLP_COOKIES_FILE = r"data\cookies\youtube.txt"
 
+    # --- yt-dlp: robustez frente a 429 en subtítulos ---
+    # 0 = si falla por subtítulos (429), reintentar sin subtítulos (descargar vídeo); 1 = obligatorio fallar
+    try:
+        YTDLP_SUBS_REQUIRED: bool = os.getenv("YTDLP_SUBS_REQUIRED", "0").strip().lower() in (
+            "1",
+            "true",
+        )
+    except Exception:
+        YTDLP_SUBS_REQUIRED = False
+    # Dormir entre peticiones para reducir 429 (segundos, puede ser float). 0 = desactivado.
+    try:
+        YTDLP_SLEEP_REQUESTS: float = float(os.getenv("YTDLP_SLEEP_REQUESTS", "0"))
+    except Exception:
+        YTDLP_SLEEP_REQUESTS = 0.0
+
 
 settings = Settings()

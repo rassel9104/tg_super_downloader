@@ -27,6 +27,7 @@ except Exception:
         YTDLP_COOKIES = None
         YTDLP_PROXY = None
         YTDLP_FORCE_IPV4 = False
+        YTDLP_COOKIES_MODE = "auto"
 
     settings = _Dummy()
 
@@ -73,6 +74,8 @@ def _common_args(
     use_cookies: bool,
     allow_playlist: bool,
     max_items: int | None = None,
+    *,
+    with_subs: bool = True,
 ) -> list[str]:
     fmt = getattr(settings, "YTDLP_FORMAT", "bv*+ba/b")
     mrg = getattr(settings, "YTDLP_MERGE_FORMAT", "mp4")
@@ -112,11 +115,14 @@ def _common_args(
         "postprocess:%(progress._percent_str)s post",
         "--no-warnings",
     ]
+    # Suavizado contra 429 global (si se configuró)
+    if getattr(settings, "YTDLP_SLEEP_REQUESTS", 0) and settings.YTDLP_SLEEP_REQUESTS > 0:
+        args += ["--sleep-requests", str(settings.YTDLP_SLEEP_REQUESTS)]
     # --- Cookies / autenticación (YouTube) ---
     if use_cookies:
         args += _cookies_args()
     # --- Subtítulos (español / auto) ---
-    if getattr(settings, "YTDLP_WRITE_SUBS", False):
+    if with_subs and getattr(settings, "YTDLP_WRITE_SUBS", False):
         # Saneamos lista de lenguas
         raw = (
             (getattr(settings, "YTDLP_SUB_LANGS", "es,es-419,es-ES") or "")
@@ -214,7 +220,15 @@ def _cookies_args() -> list[str]:
     return []
 
 
-# --- NUEVO  ---
+def _looks_dpapi(lines: list[str]) -> bool:
+    return any("Failed to decrypt with DPAPI" in ln for ln in (lines or []))
+
+
+def _looks_subs_429(lines: list[str]) -> bool:
+    if not lines:
+        return False
+    s = "\n".join(lines)
+    return ("Unable to download video subtitles" in s and "429" in s) or "HTTP Error 429" in s
 
 
 def _subfolder_mode() -> str:
@@ -491,19 +505,44 @@ async def download_proc(
                 proc.kill()
             return False, lines
 
-    # 1) con cookies (si procede)
+    # 1) con cookies (navegador o file, según settings/_cookies_args)
     ok1, lines = await _run(use_cookies=True)
     if ok1:
         return True
+    # Si falló por DPAPI y estamos en 'auto': intentar con cookies de archivo si existen
+    if _looks_dpapi(lines) and settings.YTDLP_COOKIES_MODE in {"auto", "browser"}:
+        cookie_file = getattr(settings, "YTDLP_COOKIES_FILE", r"data\cookies\youtube.txt")
+        if os.path.exists(cookie_file):
+            logger.warning(
+                "[YTDLP][retry] DPAPI detectado → usando cookies de archivo: %s", cookie_file
+            )
+            # fuerza modo file en este intento
+            saved_mode = settings.YTDLP_COOKIES_MODE
+            try:
+                settings.YTDLP_COOKIES_MODE = "file"
+                okf, linesf = await _run(use_cookies=True)
+            finally:
+                settings.YTDLP_COOKIES_MODE = saved_mode
+            if okf:
+                return True
+            lines = (lines or []) + (linesf or [])
 
-    # 2) sin cookies (fallback)
+    # Si el error fue 429 en subtítulos y los subs NO son obligatorios: reintentar sin subtítulos (con ismo modo cookies=off)
+    if _looks_subs_429(lines) and not getattr(settings, "YTDLP_SUBS_REQUIRED", False):
+        logger.warning("[YTDLP][retry] 429 en subtítulos → reintento sin subtítulos")
+        ok_subless, _ = await _run(
+            use_cookies=False
+        )  # mismo inner _run ya arma args; ajustamos with_subs' dentro
+        if ok_subless:
+            return True
+
+    # 2) sin cookies (fallback general)
     if _looks_403(lines):
         logger.warning("[YTDLP][retry] 403 detectado; reintentando SIN cookies…")
     else:
         logger.warning("[YTDLP][retry] rc!=0; reintentando SIN cookies como fallback…")
     ok2, lines2 = await _run(use_cookies=False)
     if ok2:
-        # Post-proceso: generar NFO si está habilitado
         if getattr(settings, "YTDLP_METADATA_NFO", True):
             with contextlib.suppress(Exception):
                 _emit_nfo_for_recent(outdir)

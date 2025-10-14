@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import math
 import os
 import re
 import shutil
@@ -566,6 +567,69 @@ def _iso_date_from_upload(s: str | None) -> str:
     return f"{y}-{m}-{d}"
 
 
+def _to_int(n) -> int:
+    try:
+        return int(n)
+    except Exception:
+        return 0
+
+
+def _ensure_text(el, value: str | None):
+    if value is None:
+        value = ""
+    el.text = str(value)
+
+
+def _rating_10_scale(avg: float | None) -> str | None:
+    if avg is None:
+        return None
+    try:
+        # YouTube average_rating suele venir en escala 0-5; normalizamos a 0-10
+        val = float(avg)
+        if 0.0 <= val <= 5.0:
+            return f"{(val * 2.0):.1f}"
+        # Si ya viniera 0-10, respétalo
+        if 0.0 <= val <= 10.0:
+            return f"{val:.1f}"
+    except Exception:
+        pass
+    return None
+
+
+def _write_tvshow_nfo(
+    folder: Path,
+    *,
+    title: str,
+    plot: str | None,
+    studio: str | None,
+    uid: str | None,
+    uid_type: str,
+) -> None:
+    """
+    Genera un tvshow.nfo mínimo para Jellyfin/Emby si no existe.
+    """
+    try:
+        nfo = folder / "tvshow.nfo"
+        if nfo.exists():
+            return
+        import xml.etree.ElementTree as ET
+
+        root = ET.Element("tvshow")
+        ET.SubElement(root, "title").text = title or "YouTube"
+        if plot:
+            ET.SubElement(root, "plot").text = plot
+        if studio:
+            ET.SubElement(root, "studio").text = studio
+        if uid:
+            u = ET.SubElement(root, "uniqueid")
+            u.set("type", uid_type)
+            u.text = uid
+        ET.ElementTree(root).write(nfo, encoding="utf-8", xml_declaration=True)
+    except Exception:
+        # No bloquea el flujo de descarga si falla la escritura de tvshow.nfo
+        pass
+
+
 def _write_nfo_from_info_json(info_json_path: Path) -> None:
     with info_json_path.open("r", encoding="utf-8") as f:
         info = __import__("json").load(f)
@@ -573,10 +637,19 @@ def _write_nfo_from_info_json(info_json_path: Path) -> None:
     title = info.get("title") or info.get("fulltitle") or ""
     fulltitle = info.get("fulltitle") or title
     plot = info.get("description") or ""
-    duration = int(info.get("duration") or 0)
+    duration = _to_int(info.get("duration") or 0)
     uploader = info.get("uploader") or info.get("channel") or ""
     upload_date = _iso_date_from_upload(info.get("upload_date"))
     uid = info.get("id") or ""
+    avg_rating = info.get("average_rating")  # suele ser 0..5
+    categories = info.get("categories") or []
+    tags = info.get("tags") or []
+    year = None
+    if upload_date:
+        try:
+            year = int(upload_date.split("-")[0])
+        except Exception:
+            year = None
     thumb = None
     # yt-dlp guarda .jpg al lado del media (con outtmpl). Si hay "thumbnails" en JSON, usamos la mayor
     thumbs = info.get("thumbnails") or []
@@ -585,15 +658,34 @@ def _write_nfo_from_info_json(info_json_path: Path) -> None:
         thumb = thumbs_sorted[0].get("url")
 
     root = ET.Element("movie")
-    ET.SubElement(root, "title").text = title
-    ET.SubElement(root, "originaltitle").text = fulltitle
-    ET.SubElement(root, "plot").text = plot
+    _ensure_text(ET.SubElement(root, "title"), title)
+    _ensure_text(ET.SubElement(root, "originaltitle"), fulltitle)
+    _ensure_text(ET.SubElement(root, "plot"), plot)
     if duration > 0:
-        ET.SubElement(root, "runtime").text = str(max(1, duration // 60))
+        # runtime en minutos, redondeo hacia arriba
+        ET.SubElement(root, "runtime").text = str(max(1, math.ceil(duration / 60)))
+    if year:
+        ET.SubElement(root, "year").text = str(year)
     if upload_date:
+        # Compatibilidad: algunos scrapers prefieren premiered; otros aired
+        ET.SubElement(root, "premiered").text = upload_date
         ET.SubElement(root, "aired").text = upload_date
     if uploader:
         ET.SubElement(root, "studio").text = uploader
+    r10 = _rating_10_scale(avg_rating)
+    if r10:
+        # Jellyfin/Emby aceptan <rating> plano
+        ET.SubElement(root, "rating").text = r10
+    # Géneros (categorías)
+    if isinstance(categories, list):
+        for g in categories:
+            if g:
+                ET.SubElement(root, "genre").text = str(g)
+    # Tags
+    if isinstance(tags, list):
+        for t in tags[:10]:  # evita ruido excesivo
+            if t:
+                ET.SubElement(root, "tag").text = str(t)
     uid_el = ET.SubElement(root, "uniqueid")
     uid_el.set("type", "youtube")
     uid_el.text = uid
@@ -603,6 +695,36 @@ def _write_nfo_from_info_json(info_json_path: Path) -> None:
     nfo_path = info_json_path.with_suffix(".nfo")
     ET.ElementTree(root).write(nfo_path, encoding="utf-8", xml_declaration=True)
 
+    # === tvshow.nfo (playlist/canal) ===
+    # Si el archivo tiene 'playlist_title' y la salida se guardó en subcarpeta de playlist,
+    # generamos tvshow.nfo en dicha carpeta.
+    try:
+        playlist_title = info.get("playlist_title")
+        playlist_id = info.get("playlist_id")
+        channel_id = info.get("channel_id")
+        # info_json_path: <outdir>/<subdir>/<file>.info.json
+        parent = info_json_path.parent
+        if playlist_title and playlist_id:
+            _write_tvshow_nfo(
+                parent,
+                title=playlist_title,
+                plot=info.get("playlist_description") or "",
+                studio=uploader or "",
+                uid=playlist_id,
+                uid_type="youtube:playlist",
+            )
+        elif uploader and channel_id:
+            _write_tvshow_nfo(
+                parent,
+                title=uploader,
+                plot=info.get("channel") or "",
+                studio=uploader or "",
+                uid=channel_id,
+                uid_type="youtube:channel",
+            )
+    except Exception:
+        pass
+
 
 def _emit_nfo_for_recent(outdir: Path) -> int:
     """
@@ -610,7 +732,8 @@ def _emit_nfo_for_recent(outdir: Path) -> int:
     Devuelve cuántos NFO se generaron.
     """
     n = 0
-    for j in outdir.glob("*.info.json"):
+    # Recursivo: soporta subcarpetas de playlist/canal
+    for j in Path(outdir).rglob("*.info.json"):
         nfo = j.with_suffix(".nfo")
         if not nfo.exists():
             _write_nfo_from_info_json(j)

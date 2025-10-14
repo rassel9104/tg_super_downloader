@@ -291,13 +291,16 @@ async def _track_aria2_progress(
         logger.error("progress tracker crashed gid=%s err=%r", gid, e)
 
 
-async def _await_aria2_and_notify(qid: int, gid: str, notify_chat_id: int | None, bot) -> str:
+async def _await_aria2_and_notify(
+    qid: int, gid: str, notify_chat_id: int | None, bot
+) -> tuple[str, str]:
     """
     Espera cooperativamente a que aria2 complete/erroree/sea removido.
     Actualiza progreso en DB y usa _track_aria2_progress para UX.
-    Retorna el status final ('complete'|'error'|'removed'|'unknown').
+    Retorna (status_final, filename_resuelto).
     """
     status = "unknown"
+    filename = ""
     # Lanzar tracker de mensaje editable (sin bloquear) si hay chat
     tracker = None
     try:
@@ -314,6 +317,16 @@ async def _await_aria2_and_notify(qid: int, gid: str, notify_chat_id: int | None
             except Exception:
                 st = {}
             status = (st.get("status") or "").lower()
+            # Derivar nombre, total y done para progreso/retorno
+            files = st.get("files") or []
+            if files:
+                p0 = (files[0].get("path") or "").strip()
+                if p0:
+                    try:
+                        filename = Path(p0).name or filename
+                    except Exception:
+                        pass
+
             total = int(st.get("totalLength") or 0)
             done = int(st.get("completedLength") or 0)
             # Persistimos progreso para el panel
@@ -332,7 +345,19 @@ async def _await_aria2_and_notify(qid: int, gid: str, notify_chat_id: int | None
         if tracker:
             with contextlib.suppress(Exception):
                 tracker.cancel()
-    return status
+    # Mensaje final explícito (además del tracker editable), para garantizar visibilidad
+    try:
+        if notify_chat_id:
+            ico = "✅" if status == "complete" else ("⛔" if status == "removed" else "❌")
+            name = filename or gid
+            await bot.send_message(
+                chat_id=notify_chat_id,
+                text=f"{ico} Descarga {'completada' if status == 'complete' else 'cancelada' if status == 'removed' else 'con error'}: {name}",
+                disable_web_page_preview=True,
+            )
+    except Exception:
+        pass
+    return status, (filename or "")
 
 
 def _slugify(name: str) -> str:
@@ -805,10 +830,10 @@ async def run_cycle(app, force_all: bool = False, notify_chat_id: int | None = N
                             gid = aria2_add_torrent(tpath, outdir)
                             db_set_ext_id(qid, gid)
                             # Esperar finalización aria2 antes de marcar done
-                            final = await _await_aria2_and_notify(
+                            final_status, _final_name = await _await_aria2_and_notify(
                                 qid, gid, row_notify_chat_id, app.bot
                             )
-                            ok = final == "complete"
+                            ok = final_status == "complete"
                             try:
                                 tpath.unlink(missing_ok=True)
                             except Exception:
@@ -820,10 +845,10 @@ async def run_cycle(app, force_all: bool = False, notify_chat_id: int | None = N
                                 if direct and aria2_enabled():
                                     gid = aria2_add(direct, outdir, headers=hdrs)
                                     db_set_ext_id(qid, gid)
-                                    final = await _await_aria2_and_notify(
+                                    final_status, _final_name = await _await_aria2_and_notify(
                                         qid, gid, row_notify_chat_id, app.bot
                                     )
-                                    ok = final == "complete"
+                                    ok = final_status == "complete"
                                 else:
                                     ok = False
                             except Exception as e:
@@ -848,10 +873,10 @@ async def run_cycle(app, force_all: bool = False, notify_chat_id: int | None = N
                                     else:
                                         gid = aria2_add(direct, outdir, headers=hdrs)
                                         db_set_ext_id(qid, gid)
-                                        final = await _await_aria2_and_notify(
+                                        final_status, _final_name = await _await_aria2_and_notify(
                                             qid, gid, row_notify_chat_id, app.bot
                                         )
-                                        ok = final == "complete"
+                                        ok = final_status == "complete"
                             except Exception as e:
                                 print(f"[DBG] sourceforge error: {e!r}")
                                 ok = False
@@ -1000,10 +1025,10 @@ async def run_cycle(app, force_all: bool = False, notify_chat_id: int | None = N
                                 try:
                                     gid = aria2_add(url, outdir)
                                     db_set_ext_id(qid, gid)
-                                    final = await _await_aria2_and_notify(
+                                    final_status, _final_name = await _await_aria2_and_notify(
                                         qid, gid, row_notify_chat_id, app.bot
                                     )
-                                    ok = final == "complete"
+                                    ok = final_status == "complete"
                                 except Exception as e:
                                     print(f"[DBG] aria2 error: {e!r}")
                                     ok = False

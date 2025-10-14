@@ -44,10 +44,15 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _cookies_path_valid() -> str | None:
+    """
+    Sólo devuelve ruta válida cuando el modo explícito es 'file'.
+    Sirve como helper defensivo para compatibilidad futura.
+    """
     try:
-        ck = getattr(settings, "YTDLP_COOKIES", None)
-        if not ck:
+        mode = (getattr(settings, "YTDLP_COOKIES_MODE", "browser") or "browser").lower()
+        if mode != "file":
             return None
+        ck = getattr(settings, "YTDLP_COOKIES_FILE", r"data\cookies\youtube.txt")
         p = Path(ck)
         return str(p) if p.exists() else None
     except Exception:
@@ -156,11 +161,6 @@ def _common_args(
             args += ["--playlist-end", str(max_items)]
             args += ["--playlist-items", f"1-{max_items}"]  # redundante pero inofensivo
             args += ["--max-downloads", str(max_items)]  # corte duro universal
-
-    if use_cookies:
-        ck = _cookies_path_valid()
-        if ck:
-            args += ["--cookies", ck]
 
     proxy = getattr(settings, "YTDLP_PROXY", None)
     if proxy:

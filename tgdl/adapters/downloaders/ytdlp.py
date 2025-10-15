@@ -6,6 +6,7 @@ import contextlib
 import os
 import re
 import shutil
+import sys
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from pathlib import Path
@@ -89,6 +90,7 @@ def _common_args(
     *,
     with_subs: bool = True,
     fmt_override: str | None = None,
+    extractor_override: str | None = None,
 ) -> list[str]:
     fmt = fmt_override or getattr(settings, "YTDLP_FORMAT", "bv*+ba/b")
     mrg = getattr(settings, "YTDLP_MERGE_FORMAT", "mp4")
@@ -185,7 +187,11 @@ def _common_args(
         args += ["--proxy", proxy]
 
     if getattr(settings, "YTDLP_FORCE_IPV4", False):
-        args += ["--source-address", "0.0.0.0"]
+        args += ["--force-ipv4"]
+
+    # Permitir sobreescribir extractor-args (p.ej. 403 → usar sólo 'web')
+    if extractor_override:
+        args += ["--extractor-args", extractor_override]
 
     args.append(url)
     return args
@@ -213,6 +219,22 @@ def _default_outtmpl(outdir: Path) -> str:
     Usamos un nombre Windows-safe y dejamos que yt-dlp gestione el slug del título.
     """
     return str(outdir / "%(title).200B [%(id)s].%(ext)s")
+
+
+def _resolve_yt_dlp() -> str:
+    """
+    Windows-first: prioriza el yt-dlp del venv (junto a sys.executable),
+    luego PATH (shutil.which), y por último 'yt-dlp'.
+    """
+    try:
+        exe = Path(sys.executable)
+        for name in ("yt-dlp.exe", "yt-dlp"):
+            cand = exe.with_name(name)
+            if cand.exists():
+                return str(cand)
+    except Exception:
+        pass
+    return shutil.which("yt-dlp") or "yt-dlp"
 
 
 # ================= Cookies helpers =================
@@ -414,8 +436,14 @@ async def download_proc(
                 }
             )
 
-    async def _run(use_cookies: bool, *, fmt_override: str | None = None) -> tuple[bool, list[str]]:
-        yt = shutil.which("yt-dlp") or "yt-dlp"
+    async def _run(
+        use_cookies: bool,
+        *,
+        with_subs: bool = True,
+        fmt_override: str | None = None,
+        extractor_override: str | None = None,
+    ) -> tuple[bool, list[str]]:
+        yt = _resolve_yt_dlp()
         outtmpl = _make_outtmpl(outdir, url, allow_playlist)
         args = [
             yt,
@@ -425,7 +453,9 @@ async def download_proc(
                 use_cookies=use_cookies,
                 allow_playlist=allow_playlist,
                 max_items=max_items,
+                with_subs=with_subs,
                 fmt_override=fmt_override,
+                extractor_override=extractor_override,
             ),
         ]
 
@@ -535,16 +565,21 @@ async def download_proc(
             return False, lines
 
     # 1) con cookies (navegador o file, según settings/_cookies_args)
-    ok1, lines = await _run(use_cookies=True)
+    ok1, lines = await _run(use_cookies=True, with_subs=True)
     if ok1:
+        if getattr(settings, "YTDLP_METADATA_NFO", True):
+            with contextlib.suppress(Exception):
+                _emit_nfo_for_recent(outdir)
         return True
     # 1.b) Si el fallo es "Requested format is not available", reintenta con formato de fallback
     if _looks_fmt_unavailable(lines):
         logger.warning("[YTDLP][retry] sin match de formato → último intento con 'best'")
-        ok_best, lines_best = await _run(use_cookies=True, fmt_override="best")
-        if ok_best:
+        ok_fmt, lines_fmt = await _run(
+            use_cookies=True, with_subs=True, fmt_override="bestvideo*+bestaudio/best"
+        )
+        if ok_fmt:
             return True
-        lines = (lines or []) + (lines_best or [])
+        lines = (lines or []) + (lines_fmt or [])
 
     # Si falló por DPAPI y estamos en 'auto'/'browser': intentar con cookies de archivo si existen
     if _looks_dpapi(lines) and settings.YTDLP_COOKIES_MODE in {"auto", "browser"}:
@@ -556,7 +591,7 @@ async def download_proc(
             saved_mode = settings.YTDLP_COOKIES_MODE
             try:
                 settings.YTDLP_COOKIES_MODE = "file"
-                okf, linesf = await _run(use_cookies=True)
+                okf, linesf = await _run(use_cookies=True, with_subs=True)
             finally:
                 settings.YTDLP_COOKIES_MODE = saved_mode
             if okf:
@@ -565,6 +600,21 @@ async def download_proc(
                         _emit_nfo_for_recent(outdir)
                 return True
             lines = (lines or []) + (linesf or [])
+    # Si hubo 403 con cookies, probamos mismo cookies con formato más laxo y player_client web
+    if _looks_403(lines):
+        logger.warning("[YTDLP][retry] 403 con cookies → reintento 'best' + extractor web")
+        ok_c403, lines_c403 = await _run(
+            use_cookies=True,
+            with_subs=True,
+            fmt_override="best",
+            extractor_override="youtube:player_client=web",
+        )
+        if ok_c403:
+            if getattr(settings, "YTDLP_METADATA_NFO", True):
+                with contextlib.suppress(Exception):
+                    _emit_nfo_for_recent(outdir)
+            return True
+        lines = (lines or []) + (lines_c403 or [])
 
     # Si el error fue 429 en subtítulos y los subs NO son obligatorios → reintentar sin subtítulos
     if _looks_subs_429(lines) and not getattr(settings, "YTDLP_SUBS_REQUIRED", False):

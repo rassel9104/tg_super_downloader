@@ -156,6 +156,49 @@ class Settings(BaseSettings):
         YTDLP_SLEEP_REQUESTS: float = float(os.getenv("YTDLP_SLEEP_REQUESTS", "0"))
     except Exception:
         YTDLP_SLEEP_REQUESTS = 0.0
+    # --- YouTube hardening (HTTP/CDN/403) ---
+    try:
+        YTDLP_YT_CLIENT: str = (
+            os.getenv("YTDLP_YT_CLIENT", "web").strip().lower()
+        )  # web|android|ios
+    except Exception:
+        YTDLP_YT_CLIENT = "web"
+    try:
+        YTDLP_FORCE_IPV4: bool = os.getenv("YTDLP_FORCE_IPV4", "1").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+    except Exception:
+        YTDLP_FORCE_IPV4 = True
+    try:
+        YTDLP_USER_AGENT: str = os.getenv(
+            "YTDLP_USER_AGENT",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        )
+    except Exception:
+        YTDLP_USER_AGENT = "Mozilla/5.0"
+    try:
+        YTDLP_ADD_REFERER: bool = os.getenv("YTDLP_ADD_REFERER", "1").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+    except Exception:
+        YTDLP_ADD_REFERER = True
+    try:
+        YTDLP_HTTP_CHUNK: str = os.getenv("YTDLP_HTTP_CHUNK", "10M")  # 0|1M|10M|...
+    except Exception:
+        YTDLP_HTTP_CHUNK = "10M"
+    try:
+        YTDLP_RETRIES: int = int(os.getenv("YTDLP_RETRIES", "3"))
+    except Exception:
+        YTDLP_RETRIES = 3
+    try:
+        YTDLP_RETRY_SLEEP: float = float(os.getenv("YTDLP_RETRY_SLEEP", "2"))
+    except Exception:
+        YTDLP_RETRY_SLEEP = 2.0
 
 
 settings = Settings()

@@ -1,8 +1,8 @@
+# tgdl/adapters/downloaders/ytdlp.py  (CRLF)
 from __future__ import annotations
 
 import asyncio
 import contextlib
-import math
 import os
 import re
 import shutil
@@ -28,7 +28,18 @@ except Exception:
         YTDLP_COOKIES = None
         YTDLP_PROXY = None
         YTDLP_FORCE_IPV4 = False
-        YTDLP_COOKIES_MODE = "auto"
+        YTDLP_COOKIES_MODE = "auto"  # 'browser', 'file', 'off', 'auto'
+        YTDLP_BROWSER = "edge"  # 'chrome', 'chromium', 'edge', 'firefox', 'brave'
+        YTDLP_BROWSER_PROFILE = "Default"
+        YTDLP_COOKIES_FILE = r"data\cookies\youtube.txt"
+        YTDLP_WRITE_SUBS = True
+        YTDLP_SUB_LANGS = "es,es-419,es-ES"
+        YTDLP_CONVERT_SUBS = "srt"  # 'srt', 'vtt', ''
+        YTDLP_METADATA_NFO = True
+        YTDLP_WRITE_THUMB = True
+        YTDLP_SUBS_REQUIRED = False
+        YTDLP_SLEEP_REQUESTS = 0  # segundos (float) a esperar entre requests
+        YTDLP_SUBFOLDERS = "channel"  # 'playlist', 'channel', 'none'
 
     settings = _Dummy()
 
@@ -44,15 +55,10 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _cookies_path_valid() -> str | None:
-    """
-    Sólo devuelve ruta válida cuando el modo explícito es 'file'.
-    Sirve como helper defensivo para compatibilidad futura.
-    """
     try:
-        mode = (getattr(settings, "YTDLP_COOKIES_MODE", "browser") or "browser").lower()
-        if mode != "file":
+        ck = getattr(settings, "YTDLP_COOKIES", None)
+        if not ck:
             return None
-        ck = getattr(settings, "YTDLP_COOKIES_FILE", r"data\cookies\youtube.txt")
         p = Path(ck)
         return str(p) if p.exists() else None
     except Exception:
@@ -82,8 +88,9 @@ def _common_args(
     max_items: int | None = None,
     *,
     with_subs: bool = True,
+    fmt_override: str | None = None,
 ) -> list[str]:
-    fmt = getattr(settings, "YTDLP_FORMAT", "bv*+ba/b")
+    fmt = fmt_override or getattr(settings, "YTDLP_FORMAT", "bv*+ba/b")
     mrg = getattr(settings, "YTDLP_MERGE_FORMAT", "mp4")
     cfd = str(getattr(settings, "YTDLP_CONCURRENT_FRAGMENTS", 1))
     thr = str(getattr(settings, "YTDLP_THROTTLED_RATE", 1048576))
@@ -121,6 +128,12 @@ def _common_args(
         "postprocess:%(progress._percent_str)s post",
         "--no-warnings",
     ]
+    # Opcional: User-Agent / Referer para YouTube (reduce 403 en algunos CDNs)
+    ua = getattr(settings, "YTDLP_USER_AGENT", None)
+    if ua:
+        args += ["--user-agent", ua]
+    if getattr(settings, "YTDLP_ADD_REFERER", False):
+        args += ["--add-header", "Referer: https://www.youtube.com/"]
     # Suavizado contra 429 global (si se configuró)
     if getattr(settings, "YTDLP_SLEEP_REQUESTS", 0) and settings.YTDLP_SLEEP_REQUESTS > 0:
         args += ["--sleep-requests", str(settings.YTDLP_SLEEP_REQUESTS)]
@@ -162,6 +175,11 @@ def _common_args(
             args += ["--playlist-items", f"1-{max_items}"]  # redundante pero inofensivo
             args += ["--max-downloads", str(max_items)]  # corte duro universal
 
+    if use_cookies:
+        ck = _cookies_path_valid()
+        if ck:
+            args += ["--cookies", ck]
+
     proxy = getattr(settings, "YTDLP_PROXY", None)
     if proxy:
         args += ["--proxy", proxy]
@@ -171,6 +189,21 @@ def _common_args(
 
     args.append(url)
     return args
+
+
+# --- Detectores de error comunes ---
+_RE_FMT_UNAVAILABLE = re.compile(r"Requested\s+format\s+is\s+not\s+available", re.I)
+
+
+def _looks_fmt_unavailable(lines: list[str]) -> bool:
+    return any(_RE_FMT_UNAVAILABLE.search(ln or "") for ln in (lines or []))
+
+
+_RE_SIGNIN_BOT = re.compile(r"Sign in to confirm you(?:'|’)re not a bot", re.I)
+
+
+def _looks_signin_bot(lines: list[str]) -> bool:
+    return any(_RE_SIGNIN_BOT.search(ln or "") for ln in (lines or []))
 
 
 # ================= outtmpl helper =================
@@ -259,11 +292,7 @@ def _make_outtmpl(outdir: Path, url: str, allow_playlist: bool) -> str:
     mode = _subfolder_mode()
     if allow_playlist and mode == "playlist":
         return f"{base}/%(playlist_title)s/%(title).200B [%(id)s].%(ext)s"
-    if _is_channel_url(url) and mode in (
-        "channel",
-        "playlist",
-    ):  # permitimos carpeta también en 'playlist'
-        # uploader es más estable que channel en muchos casos
+    if _is_channel_url(url) and mode in ("channel", "playlist"):
         return f"{base}/%(uploader)s/%(title).200B [%(id)s].%(ext)s"
     return f"{base}/%(title).200B [%(id)s].%(ext)s"
 
@@ -385,7 +414,7 @@ async def download_proc(
                 }
             )
 
-    async def _run(use_cookies: bool) -> tuple[bool, list[str]]:
+    async def _run(use_cookies: bool, *, fmt_override: str | None = None) -> tuple[bool, list[str]]:
         yt = shutil.which("yt-dlp") or "yt-dlp"
         outtmpl = _make_outtmpl(outdir, url, allow_playlist)
         args = [
@@ -396,6 +425,7 @@ async def download_proc(
                 use_cookies=use_cookies,
                 allow_playlist=allow_playlist,
                 max_items=max_items,
+                fmt_override=fmt_override,
             ),
         ]
 
@@ -428,9 +458,7 @@ async def download_proc(
         re_item_start = re.compile(r"^\[download\]\s+Destination:\s+(.+)$", re.I)
         re_item_done = re.compile(r"^\[download\]\s+100%\s", re.I)
         re_item_skip = re.compile(r"^\[download\]\s+(.+?) has already been downloaded", re.I)
-        re_merging = re.compile(
-            r"^\[Merger\]\s+Merging formats into", re.I
-        )  # a veces el 100% no se ve claro
+        re_merging = re.compile(r"^\[Merger\]\s+Merging formats into", re.I)
 
         async def _pump():
             nonlocal items_started, items_done
@@ -510,14 +538,21 @@ async def download_proc(
     ok1, lines = await _run(use_cookies=True)
     if ok1:
         return True
-    # Si falló por DPAPI y estamos en 'auto': intentar con cookies de archivo si existen
+    # 1.b) Si el fallo es "Requested format is not available", reintenta con formato de fallback
+    if _looks_fmt_unavailable(lines):
+        logger.warning("[YTDLP][retry] sin match de formato → último intento con 'best'")
+        ok_best, lines_best = await _run(use_cookies=True, fmt_override="best")
+        if ok_best:
+            return True
+        lines = (lines or []) + (lines_best or [])
+
+    # Si falló por DPAPI y estamos en 'auto'/'browser': intentar con cookies de archivo si existen
     if _looks_dpapi(lines) and settings.YTDLP_COOKIES_MODE in {"auto", "browser"}:
         cookie_file = getattr(settings, "YTDLP_COOKIES_FILE", r"data\cookies\youtube.txt")
         if os.path.exists(cookie_file):
             logger.warning(
                 "[YTDLP][retry] DPAPI detectado → usando cookies de archivo: %s", cookie_file
             )
-            # fuerza modo file en este intento
             saved_mode = settings.YTDLP_COOKIES_MODE
             try:
                 settings.YTDLP_COOKIES_MODE = "file"
@@ -525,24 +560,28 @@ async def download_proc(
             finally:
                 settings.YTDLP_COOKIES_MODE = saved_mode
             if okf:
+                if getattr(settings, "YTDLP_METADATA_NFO", True):
+                    with contextlib.suppress(Exception):
+                        _emit_nfo_for_recent(outdir)
                 return True
             lines = (lines or []) + (linesf or [])
 
-    # Si el error fue 429 en subtítulos y los subs NO son obligatorios: reintentar sin subtítulos (con ismo modo cookies=off)
+    # Si el error fue 429 en subtítulos y los subs NO son obligatorios → reintentar sin subtítulos
     if _looks_subs_429(lines) and not getattr(settings, "YTDLP_SUBS_REQUIRED", False):
         logger.warning("[YTDLP][retry] 429 en subtítulos → reintento sin subtítulos")
-        ok_subless, _ = await _run(
-            use_cookies=False
-        )  # mismo inner _run ya arma args; ajustamos with_subs' dentro
+        ok_subless, _ = await _run(use_cookies=False, with_subs=False)
         if ok_subless:
+            if getattr(settings, "YTDLP_METADATA_NFO", True):
+                with contextlib.suppress(Exception):
+                    _emit_nfo_for_recent(outdir)
             return True
 
     # 2) sin cookies (fallback general)
-    if _looks_403(lines):
+    if _looks_403(lines) or _looks_signin_bot(lines):
         logger.warning("[YTDLP][retry] 403 detectado; reintentando SIN cookies…")
     else:
         logger.warning("[YTDLP][retry] rc!=0; reintentando SIN cookies como fallback…")
-    ok2, lines2 = await _run(use_cookies=False)
+    ok2, lines2 = await _run(use_cookies=False, with_subs=True)
     if ok2:
         if getattr(settings, "YTDLP_METADATA_NFO", True):
             with contextlib.suppress(Exception):
@@ -567,69 +606,6 @@ def _iso_date_from_upload(s: str | None) -> str:
     return f"{y}-{m}-{d}"
 
 
-def _to_int(n) -> int:
-    try:
-        return int(n)
-    except Exception:
-        return 0
-
-
-def _ensure_text(el, value: str | None):
-    if value is None:
-        value = ""
-    el.text = str(value)
-
-
-def _rating_10_scale(avg: float | None) -> str | None:
-    if avg is None:
-        return None
-    try:
-        # YouTube average_rating suele venir en escala 0-5; normalizamos a 0-10
-        val = float(avg)
-        if 0.0 <= val <= 5.0:
-            return f"{(val * 2.0):.1f}"
-        # Si ya viniera 0-10, respétalo
-        if 0.0 <= val <= 10.0:
-            return f"{val:.1f}"
-    except Exception:
-        pass
-    return None
-
-
-def _write_tvshow_nfo(
-    folder: Path,
-    *,
-    title: str,
-    plot: str | None,
-    studio: str | None,
-    uid: str | None,
-    uid_type: str,
-) -> None:
-    """
-    Genera un tvshow.nfo mínimo para Jellyfin/Emby si no existe.
-    """
-    try:
-        nfo = folder / "tvshow.nfo"
-        if nfo.exists():
-            return
-        import xml.etree.ElementTree as ET
-
-        root = ET.Element("tvshow")
-        ET.SubElement(root, "title").text = title or "YouTube"
-        if plot:
-            ET.SubElement(root, "plot").text = plot
-        if studio:
-            ET.SubElement(root, "studio").text = studio
-        if uid:
-            u = ET.SubElement(root, "uniqueid")
-            u.set("type", uid_type)
-            u.text = uid
-        ET.ElementTree(root).write(nfo, encoding="utf-8", xml_declaration=True)
-    except Exception:
-        # No bloquea el flujo de descarga si falla la escritura de tvshow.nfo
-        pass
-
-
 def _write_nfo_from_info_json(info_json_path: Path) -> None:
     with info_json_path.open("r", encoding="utf-8") as f:
         info = __import__("json").load(f)
@@ -637,19 +613,10 @@ def _write_nfo_from_info_json(info_json_path: Path) -> None:
     title = info.get("title") or info.get("fulltitle") or ""
     fulltitle = info.get("fulltitle") or title
     plot = info.get("description") or ""
-    duration = _to_int(info.get("duration") or 0)
+    duration = int(info.get("duration") or 0)
     uploader = info.get("uploader") or info.get("channel") or ""
     upload_date = _iso_date_from_upload(info.get("upload_date"))
     uid = info.get("id") or ""
-    avg_rating = info.get("average_rating")  # suele ser 0..5
-    categories = info.get("categories") or []
-    tags = info.get("tags") or []
-    year = None
-    if upload_date:
-        try:
-            year = int(upload_date.split("-")[0])
-        except Exception:
-            year = None
     thumb = None
     # yt-dlp guarda .jpg al lado del media (con outtmpl). Si hay "thumbnails" en JSON, usamos la mayor
     thumbs = info.get("thumbnails") or []
@@ -658,34 +625,15 @@ def _write_nfo_from_info_json(info_json_path: Path) -> None:
         thumb = thumbs_sorted[0].get("url")
 
     root = ET.Element("movie")
-    _ensure_text(ET.SubElement(root, "title"), title)
-    _ensure_text(ET.SubElement(root, "originaltitle"), fulltitle)
-    _ensure_text(ET.SubElement(root, "plot"), plot)
+    ET.SubElement(root, "title").text = title
+    ET.SubElement(root, "originaltitle").text = fulltitle
+    ET.SubElement(root, "plot").text = plot
     if duration > 0:
-        # runtime en minutos, redondeo hacia arriba
-        ET.SubElement(root, "runtime").text = str(max(1, math.ceil(duration / 60)))
-    if year:
-        ET.SubElement(root, "year").text = str(year)
+        ET.SubElement(root, "runtime").text = str(max(1, duration // 60))
     if upload_date:
-        # Compatibilidad: algunos scrapers prefieren premiered; otros aired
-        ET.SubElement(root, "premiered").text = upload_date
         ET.SubElement(root, "aired").text = upload_date
     if uploader:
         ET.SubElement(root, "studio").text = uploader
-    r10 = _rating_10_scale(avg_rating)
-    if r10:
-        # Jellyfin/Emby aceptan <rating> plano
-        ET.SubElement(root, "rating").text = r10
-    # Géneros (categorías)
-    if isinstance(categories, list):
-        for g in categories:
-            if g:
-                ET.SubElement(root, "genre").text = str(g)
-    # Tags
-    if isinstance(tags, list):
-        for t in tags[:10]:  # evita ruido excesivo
-            if t:
-                ET.SubElement(root, "tag").text = str(t)
     uid_el = ET.SubElement(root, "uniqueid")
     uid_el.set("type", "youtube")
     uid_el.text = uid
@@ -695,44 +643,13 @@ def _write_nfo_from_info_json(info_json_path: Path) -> None:
     nfo_path = info_json_path.with_suffix(".nfo")
     ET.ElementTree(root).write(nfo_path, encoding="utf-8", xml_declaration=True)
 
-    # === tvshow.nfo (playlist/canal) ===
-    # Si el archivo tiene 'playlist_title' y la salida se guardó en subcarpeta de playlist,
-    # generamos tvshow.nfo en dicha carpeta.
-    try:
-        playlist_title = info.get("playlist_title")
-        playlist_id = info.get("playlist_id")
-        channel_id = info.get("channel_id")
-        # info_json_path: <outdir>/<subdir>/<file>.info.json
-        parent = info_json_path.parent
-        if playlist_title and playlist_id:
-            _write_tvshow_nfo(
-                parent,
-                title=playlist_title,
-                plot=info.get("playlist_description") or "",
-                studio=uploader or "",
-                uid=playlist_id,
-                uid_type="youtube:playlist",
-            )
-        elif uploader and channel_id:
-            _write_tvshow_nfo(
-                parent,
-                title=uploader,
-                plot=info.get("channel") or "",
-                studio=uploader or "",
-                uid=channel_id,
-                uid_type="youtube:channel",
-            )
-    except Exception:
-        pass
-
 
 def _emit_nfo_for_recent(outdir: Path) -> int:
     """
-    Recorre *.info.json y emite .nfo para cada uno que no exista.
+    Recorre **recursivamente** *.info.json y emite .nfo para cada uno que no exista.
     Devuelve cuántos NFO se generaron.
     """
     n = 0
-    # Recursivo: soporta subcarpetas de playlist/canal
     for j in Path(outdir).rglob("*.info.json"):
         nfo = j.with_suffix(".nfo")
         if not nfo.exists():

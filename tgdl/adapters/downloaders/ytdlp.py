@@ -645,64 +645,272 @@ async def download_proc(
     return False
 
 
-# ================= NFO helpers =================
+# ================= NFO helpers (Jellyfin/Emby/Kodi) =================
 
 
 def _iso_date_from_upload(s: str | None) -> str:
-    # yt-dlp upload_date -> "YYYYMMDD"
+    """yt-dlp upload_date -> YYYYMMDD → YYYY-MM-DD."""
     if not s or len(s) < 8:
         return ""
     y, m, d = s[:4], s[4:6], s[6:8]
     return f"{y}-{m}-{d}"
 
 
-def _write_nfo_from_info_json(info_json_path: Path) -> None:
-    with info_json_path.open("r", encoding="utf-8") as f:
-        info = __import__("json").load(f)
+def _env_str(name: str, default: str) -> str:
+    v = os.getenv(name)
+    return default if v in (None, "", "None") else str(v)
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return str(v).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _safe_text(x: Any) -> str:
+    return "" if x is None else str(x)
+
+
+def _pick_thumb(info: dict[str, Any]) -> str | None:
+    thumbs = info.get("thumbnails") or []
+    if isinstance(thumbs, list) and thumbs:
+        thumbs_sorted = sorted(thumbs, key=lambda t: (t.get("height") or 0), reverse=True)
+        return thumbs_sorted[0].get("url") or None
+    # fallback: yt-dlp ya convirtió .webp→.jpg al lado del media
+    # no sabemos el nombre exacto aquí; mantener URL si existe
+    return info.get("thumbnail") or None
+
+
+def _nfo_path_for_json(j: Path) -> Path:
+    """
+    Convierte 'Nombre [id].info.json' → 'Nombre [id].nfo'
+    (quita el sufijo '.info' del stem antes de cambiar extensión).
+    """
+    stem = j.stem  # p.ej. "Item1 [id1].info"
+    if stem.endswith(".info"):
+        stem = stem[:-5]
+    return j.with_name(stem + ".nfo")
+
+
+def write_movie_nfo(info: dict[str, Any], nfo_path: Path) -> None:
+    """Genera movie.nfo para un vídeo suelto (Películas)."""
     title = info.get("title") or info.get("fulltitle") or ""
     fulltitle = info.get("fulltitle") or title
     plot = info.get("description") or ""
     duration = int(info.get("duration") or 0)
-    uploader = info.get("uploader") or info.get("channel") or ""
-    upload_date = _iso_date_from_upload(info.get("upload_date"))
+    aired = _iso_date_from_upload(info.get("upload_date"))
+    studio = info.get("uploader") or info.get("channel") or ""
     uid = info.get("id") or ""
-    thumb = None
-    # yt-dlp guarda .jpg al lado del media (con outtmpl). Si hay "thumbnails" en JSON, usamos la mayor
-    thumbs = info.get("thumbnails") or []
-    if isinstance(thumbs, list) and thumbs:
-        thumbs_sorted = sorted(thumbs, key=lambda t: (t.get("height") or 0), reverse=True)
-        thumb = thumbs_sorted[0].get("url")
+    rating = info.get("average_rating")  # 0..5 o 0..10 según extractor; Jellyfin acepta 0..10
+    thumb = _pick_thumb(info)
+    genre = _env_str("YTDLP_NFO_GENRE", "YouTube")
 
     root = ET.Element("movie")
-    ET.SubElement(root, "title").text = title
-    ET.SubElement(root, "originaltitle").text = fulltitle
-    ET.SubElement(root, "plot").text = plot
+    ET.SubElement(root, "title").text = _safe_text(title)
+    ET.SubElement(root, "originaltitle").text = _safe_text(fulltitle)
+    ET.SubElement(root, "sorttitle").text = _safe_text(fulltitle or title)
+    ET.SubElement(root, "plot").text = _safe_text(plot)
     if duration > 0:
         ET.SubElement(root, "runtime").text = str(max(1, duration // 60))
-    if upload_date:
-        ET.SubElement(root, "aired").text = upload_date
-    if uploader:
-        ET.SubElement(root, "studio").text = uploader
+    if aired:
+        ET.SubElement(root, "aired").text = aired
+        ET.SubElement(root, "premiered").text = aired
+    ET.SubElement(root, "dateadded").text = _safe_text(aired)
+    if studio:
+        ET.SubElement(root, "studio").text = _safe_text(studio)
+    if genre:
+        ET.SubElement(root, "genre").text = _safe_text(genre)
+    # tags útiles para navegar por canal/playlist
+    if info.get("uploader"):
+        ET.SubElement(root, "tag").text = _safe_text(info.get("uploader"))
+    if info.get("playlist_title"):
+        ET.SubElement(root, "tag").text = _safe_text(info.get("playlist_title"))
+    # rating si está disponible (no inventar)
+    if rating is not None:
+        ratings = ET.SubElement(root, "ratings")
+        r = ET.SubElement(ratings, "rating")
+        ET.SubElement(r, "name").text = "youtube"
+        try:
+            ET.SubElement(r, "value").text = f"{float(rating):.1f}"
+        except Exception:
+            ET.SubElement(r, "value").text = _safe_text(rating)
+        ET.SubElement(r, "max").text = "10"
     uid_el = ET.SubElement(root, "uniqueid")
     uid_el.set("type", "youtube")
-    uid_el.text = uid
+    uid_el.set("default", "true")
+    uid_el.text = _safe_text(uid)
     if thumb:
-        ET.SubElement(root, "thumb").text = thumb
-
-    nfo_path = info_json_path.with_suffix(".nfo")
+        ET.SubElement(root, "thumb").text = _safe_text(thumb)
+    nfo_path.parent.mkdir(parents=True, exist_ok=True)
     ET.ElementTree(root).write(nfo_path, encoding="utf-8", xml_declaration=True)
+
+
+def write_episode_nfo(info: dict[str, Any], nfo_path: Path, *, season: int, episode: int) -> None:
+    """Genera NFO de episodio para bibliotecas de Series."""
+    title = info.get("title") or info.get("fulltitle") or ""
+    fulltitle = info.get("fulltitle") or title
+    plot = info.get("description") or ""
+    duration = int(info.get("duration") or 0)
+    aired = _iso_date_from_upload(info.get("upload_date"))
+    studio = info.get("uploader") or info.get("channel") or ""
+    uid = info.get("id") or ""
+    rating = info.get("average_rating")
+    thumb = _pick_thumb(info)
+    genre = _env_str("YTDLP_NFO_GENRE", "YouTube")
+
+    root = ET.Element("episodedetails")
+    ET.SubElement(root, "title").text = _safe_text(title)
+    ET.SubElement(root, "originaltitle").text = _safe_text(fulltitle)
+    ET.SubElement(root, "sorttitle").text = _safe_text(fulltitle or title)
+    ET.SubElement(root, "season").text = str(int(season))
+    ET.SubElement(root, "episode").text = str(int(episode))
+    if duration > 0:
+        ET.SubElement(root, "runtime").text = str(max(1, duration // 60))
+    if aired:
+        ET.SubElement(root, "aired").text = aired
+        ET.SubElement(root, "premiered").text = aired
+    ET.SubElement(root, "dateadded").text = _safe_text(aired)
+    ET.SubElement(root, "plot").text = _safe_text(plot)
+    if studio:
+        ET.SubElement(root, "studio").text = _safe_text(studio)
+    if genre:
+        ET.SubElement(root, "genre").text = _safe_text(genre)
+    if info.get("uploader"):
+        ET.SubElement(root, "tag").text = _safe_text(info.get("uploader"))
+    if info.get("playlist_title"):
+        ET.SubElement(root, "tag").text = _safe_text(info.get("playlist_title"))
+    if rating is not None:
+        ratings = ET.SubElement(root, "ratings")
+        r = ET.SubElement(ratings, "rating")
+        ET.SubElement(r, "name").text = "youtube"
+        try:
+            ET.SubElement(r, "value").text = f"{float(rating):.1f}"
+        except Exception:
+            ET.SubElement(r, "value").text = _safe_text(rating)
+        ET.SubElement(r, "max").text = "10"
+    uid_el = ET.SubElement(root, "uniqueid")
+    uid_el.set("type", "youtube")
+    uid_el.set("default", "true")
+    uid_el.text = _safe_text(uid)
+    if thumb:
+        ET.SubElement(root, "thumb").text = _safe_text(thumb)
+    nfo_path.parent.mkdir(parents=True, exist_ok=True)
+    ET.ElementTree(root).write(nfo_path, encoding="utf-8", xml_declaration=True)
+
+
+def ensure_tvshow_nfo(folder: Path, sample_info: dict[str, Any]) -> None:
+    """
+    Crea tvshow.nfo en 'folder' si no existe y hay señales de serie (playlist/canal).
+    Reglas (Jellyfin/Kodi): cada serie necesita un tvshow.nfo al nivel raíz. :contentReference[oaicite:5]index=5}
+    """
+    tv = folder / "tvshow.nfo"
+    if tv.exists():
+        return
+    title = (
+        sample_info.get("playlist_title")
+        or sample_info.get("uploader")
+        or sample_info.get("channel")
+        or "YouTube"
+    )
+    plot = (
+        sample_info.get("playlist")
+        or sample_info.get("playlist_title")
+        or sample_info.get("uploader")
+        or ""
+    )
+    studio = sample_info.get("uploader") or sample_info.get("channel") or ""
+    uid = (
+        sample_info.get("playlist_id")
+        or sample_info.get("channel_id")
+        or sample_info.get("uploader_id")
+        or ""
+    )
+    thumb = _pick_thumb(sample_info)
+
+    root = ET.Element("tvshow")
+    ET.SubElement(root, "title").text = _safe_text(title)
+    ET.SubElement(root, "originaltitle").text = _safe_text(title)
+    ET.SubElement(root, "sorttitle").text = _safe_text(title)
+    ET.SubElement(root, "plot").text = _safe_text(plot)
+    if studio:
+        ET.SubElement(root, "studio").text = _safe_text(studio)
+    ET.SubElement(root, "genre").text = _env_str("YTDLP_NFO_GENRE", "YouTube")
+    if uid:
+        uid_el = ET.SubElement(root, "uniqueid")
+        # Diferencia el tipo si lo sabemos
+        uid_el.set(
+            "type", "youtube_playlist" if sample_info.get("playlist_id") else "youtube_channel"
+        )
+        uid_el.set("default", "true")
+        uid_el.text = _safe_text(uid)
+    if thumb:
+        ET.SubElement(root, "thumb").text = _safe_text(thumb)
+    tv.parent.mkdir(parents=True, exist_ok=True)
+    ET.ElementTree(root).write(tv, encoding="utf-8", xml_declaration=True)
 
 
 def _emit_nfo_for_recent(outdir: Path) -> int:
     """
-    Recorre **recursivamente** *.info.json y emite .nfo para cada uno que no exista.
-    Devuelve cuántos NFO se generaron.
+    Recorre recursivamente *.info.json y genera:
+      - movie.nfo (archivo.nfo) para vídeos sueltos
+      - tvshow.nfo por carpeta + episodios si detecta playlist/canal
+    Comportamiento controlable por:
+      YTDLP_NFO_TV_MODE = auto|always|never
+      YTDLP_TV_SEASON_BY_YEAR = 0|1
     """
-    n = 0
+    tv_mode = _env_str("YTDLP_NFO_TV_MODE", "auto").lower()  # auto|always|never
+    season_by_year = _env_bool("YTDLP_TV_SEASON_BY_YEAR", False)
+
+    created = 0
     for j in Path(outdir).rglob("*.info.json"):
-        nfo = j.with_suffix(".nfo")
-        if not nfo.exists():
-            _write_nfo_from_info_json(j)
-            n += 1
-    return n
+        try:
+            info = __import__("json").loads(j.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+
+        folder = j.parent
+        # Nombre correcto del NFO junto al vídeo
+        nfo_path = _nfo_path_for_json(j)
+
+        # Señales de playlist/canal
+        is_playlistish = bool(
+            info.get("playlist_title") or info.get("playlist_id") or info.get("playlist_index")
+        )
+        is_channelish = bool(info.get("uploader") or info.get("channel") or info.get("channel_id"))
+        # Conteo local de .info.json en la carpeta (para decidir auto-TV por "colección")
+        try:
+            count_here = sum(1 for _ in folder.glob("*.info.json"))
+        except Exception:
+            count_here = 1
+
+        if tv_mode == "always":
+            as_tv = True
+        elif tv_mode == "never":
+            as_tv = False
+        else:  # auto
+            # TV si es playlist, o si hay colección de videos (≥2) en la misma carpeta del canal/playlist
+            as_tv = is_playlistish or (is_channelish and count_here >= 2)
+
+        if as_tv:
+            # tvshow.nfo (una vez por carpeta)
+            try:
+                ensure_tvshow_nfo(folder, info)
+            except Exception:
+                pass
+            # episodio
+            if not nfo_path.exists():
+                if season_by_year and info.get("upload_date"):
+                    season = int(_safe_text(info.get("upload_date"))[:4])
+                else:
+                    season = 1
+                episode = int(info.get("playlist_index") or 1)
+                write_episode_nfo(info, nfo_path, season=season, episode=episode)
+                created += 1
+        else:
+            # movie
+            if not nfo_path.exists():
+                write_movie_nfo(info, nfo_path)
+                created += 1
+
+    return created

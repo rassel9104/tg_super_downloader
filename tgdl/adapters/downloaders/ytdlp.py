@@ -21,15 +21,17 @@ try:
 except Exception:
 
     class _Dummy:
-        YTDLP_FORMAT = "bv*+ba/b"
-        YTDLP_MERGE_FORMAT = "mp4"
-        YTDLP_CONCURRENT_FRAGMENTS = 1
-        YTDLP_THROTTLED_RATE = 1048576
-        YTDLP_HTTP_CHUNK_SIZE = 1048576
-        YTDLP_COOKIES = None
-        YTDLP_PROXY = None
-        YTDLP_FORCE_IPV4 = False
-        YTDLP_COOKIES_MODE = "auto"  # 'browser', 'file', 'off', 'auto'
+        def __init__(self):
+            self.YTDLP_FORMAT = "bv*+ba/b"
+            self.YTDLP_MERGE_FORMAT = "mp4"
+            self.YTDLP_CONCURRENT_FRAGMENTS = 1
+            self.YTDLP_THROTTLED_RATE = 1048576
+            self.YTDLP_HTTP_CHUNK_SIZE = 1048576
+            self.YTDLP_COOKIES = None
+            self.YTDLP_PROXY = None
+            self.YTDLP_FORCE_IPV4 = False
+            self.YTDLP_COOKIES_MODE = "auto"  # 'browser', 'file', 'off', 'auto'
+
         YTDLP_BROWSER = "edge"  # 'chrome', 'chromium', 'edge', 'firefox', 'brave'
         YTDLP_BROWSER_PROFILE = "Default"
         YTDLP_COOKIES_FILE = r"data\cookies\youtube.txt"
@@ -470,7 +472,7 @@ async def download_proc(
 
         proc = await asyncio.create_subprocess_exec(
             *args,
-            stdout=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,  # Ensure stdout is set to a pipe
             stderr=asyncio.subprocess.STDOUT,
         )
         if on_start:
@@ -648,6 +650,187 @@ async def download_proc(
 # ================= NFO helpers (Jellyfin/Emby/Kodi) =================
 
 
+def _safe_name(s: str) -> str:
+    if s is None:
+        return ""
+    # Windows-safe filename
+    return re.sub(r'[<>:"/\\|?*\x00-\x1F]+', " ", s).strip().rstrip(".")
+
+
+def _upload_date_parts(info: dict[str, Any]) -> tuple[str, str, str]:
+    ud = (info.get("upload_date") or "").strip()
+    if len(ud) >= 8:
+        return ud[:4], ud[4:6], ud[6:8]
+    return "", "", ""
+
+
+def _pick_genre(info: dict[str, Any]) -> str:
+    cats = info.get("categories") or []
+    if isinstance(cats, list) and cats:
+        return str(cats[0])
+    return _env_str("YTDLP_NFO_GENRE", "YouTube")
+
+
+def _pick_mpaa(info: dict[str, Any]) -> str | None:
+    # Heurística ligera a partir de age_limit (yt-dlp). Ajusta si lo deseas.
+    age = info.get("age_limit")
+    try:
+        age = int(age) if age is not None else None
+    except Exception:
+        age = None
+    if age is None:
+        return None
+    if age <= 7:
+        return "TV-G"
+    if age <= 13:
+        return "TV-PG"
+    if age <= 16:
+        return "TV-14"
+    return "TV-MA"
+
+
+def write_movie_nfo(info: dict[str, Any], nfo_path: Path) -> None:
+    """movie.nfo (vídeo suelto). Runtime en segundos, credits=uploader, mpaa/rating si existen."""
+    title = info.get("title") or info.get("fulltitle") or ""
+    fulltitle = info.get("fulltitle") or title
+    plot = info.get("description") or ""
+    duration = int(info.get("duration") or 0)  # segundos
+    y, m, d = _upload_date_parts(info)
+    premiered = f"{y}-{m}-{d}" if y else ""
+    credits = info.get("uploader") or info.get("channel") or ""
+    rating = info.get("average_rating")
+    mpaa = _pick_mpaa(info)
+    genre = _pick_genre(info)
+
+    root = ET.Element("movie")
+    ET.SubElement(root, "title").text = _safe_text(title)
+    ET.SubElement(root, "originaltitle").text = _safe_text(fulltitle)
+    ET.SubElement(root, "plot").text = _safe_text(plot)
+    if genre:
+        ET.SubElement(root, "genre").text = _safe_text(genre)
+    ET.SubElement(root, "tag").text = "YouTube"
+    if premiered:
+        ET.SubElement(root, "premiered").text = premiered
+    if duration > 0:
+        ET.SubElement(root, "runtime").text = str(duration)  # segundos
+    if credits:
+        ET.SubElement(root, "credits").text = _safe_text(credits)
+    if rating is not None:
+        ET.SubElement(root, "rating").text = (
+            f"{float(rating):.1f}"
+            if str(rating).replace(".", "", 1).isdigit()
+            else _safe_text(rating)
+        )
+    if mpaa:
+        ET.SubElement(root, "mpaa").text = mpaa
+    # uniqueid (conservamos por interoperabilidad)
+    uid_el = ET.SubElement(root, "uniqueid")
+    uid_el.set("type", "youtube")
+    uid_el.set("default", "true")
+    uid_el.text = _safe_text(info.get("id") or "")
+    ET.ElementTree(root).write(nfo_path, encoding="utf-8", xml_declaration=True)
+
+
+def write_episode_nfo(info: dict[str, Any], nfo_path: Path, *, season: int, episode: int) -> None:
+    """episodedetails.nfo (capítulo). Añadimos year/aired/season/episode; runtime en segundos opcional."""
+    title = info.get("title") or info.get("fulltitle") or ""
+    plot = info.get("description") or ""
+    y, m, d = _upload_date_parts(info)
+    aired = f"{y}-{m}-{d}" if y else ""
+    duration = int(info.get("duration") or 0)
+    root = ET.Element("episodedetails")
+    ET.SubElement(root, "title").text = _safe_text(title)
+    ET.SubElement(root, "plot").text = _safe_text(plot)
+    if y:
+        ET.SubElement(root, "year").text = y
+    if aired:
+        ET.SubElement(root, "aired").text = aired
+    ET.SubElement(root, "season").text = str(int(season))
+    ET.SubElement(root, "episode").text = str(int(episode))
+    if duration > 0:
+        ET.SubElement(root, "runtime").text = str(duration)  # segundos (opcional)
+    ET.ElementTree(root).write(nfo_path, encoding="utf-8", xml_declaration=True)
+
+
+def ensure_tvshow_nfo(folder: Path, sample_info: dict[str, Any]) -> None:
+    """tvshow.nfo mínimo en carpeta del canal."""
+    tv = folder / "tvshow.nfo"
+    if tv.exists():
+        return
+    title = sample_info.get("uploader") or sample_info.get("channel") or "YouTube"
+    plot = sample_info.get("uploader") or sample_info.get("channel") or ""
+    root = ET.Element("tvshow")
+    ET.SubElement(root, "title").text = _safe_text(title)
+    ET.SubElement(root, "plot").text = _safe_text(plot)
+    ET.ElementTree(root).write(tv, encoding="utf-8", xml_declaration=True)
+
+
+def _match_media_for_json(j: Path) -> Path | None:
+    stem = j.stem[:-5] if j.stem.endswith(".info") else j.stem
+    for ext in _MEDIA_EXTS:
+        cand = j.with_name(stem + ext)
+        try:
+            if cand.exists() and cand.is_file():
+                return cand
+        except Exception:
+            continue
+    return None
+
+
+def _ensure_episode_layout(
+    info: dict[str, Any], json_path: Path, media_path: Path
+) -> tuple[Path, Path]:
+    """
+    Reubica capítulo a: <Canal>/<Season YYYY>/<Canal> - <YYYYMMDD> - <Título> [<ID>].ext
+    Mueve .info.json y .jpg/.png homónimos. Devuelve (nuevo_media, nuevo_json).
+    Idempotente: si ya está en destino con ese nombre, no hace nada.
+    """
+    uploader = _safe_name(info.get("uploader") or info.get("channel") or "YouTube")
+    y, m, d = _upload_date_parts(info)
+    year = y or "0000"
+    ymd = f"{y}{m}{d}".strip() if y else ""
+    title = _safe_name(info.get("title") or info.get("fulltitle") or "")
+    vid = _safe_name(info.get("id") or "")
+    base_dir = media_path.parent  # debería ser ...\Canal o similar
+    # Si el padre ya es "Season <YYYY>", su canal es el padre del padre
+    channel_dir = base_dir.parent if base_dir.name.lower().startswith("season ") else base_dir
+    season_dir = channel_dir / f"Season {year}"
+    season_dir.mkdir(parents=True, exist_ok=True)
+
+    # Nombre destino
+    ext = media_path.suffix
+    new_stem = f"{uploader} - {ymd} - {title} [{vid}]" if ymd else f"{uploader} - {title} [{vid}]"
+    new_media = season_dir / (new_stem + ext)
+    new_json = season_dir / (new_stem + ".info.json")
+
+    # Ya en destino con el mismo nombre → nada que hacer
+    if media_path.resolve() == new_media.resolve():
+        return media_path, json_path
+
+    # Mover media (atómico)
+    try:
+        os.replace(str(media_path), str(new_media))
+    except Exception:
+        pass
+
+    # Mover json
+    try:
+        os.replace(str(json_path), str(new_json))
+    except Exception:
+        pass
+
+    # Mover thumbnail homónima si existe (.jpg/.png)
+    for exti in (".jpg", ".png"):
+        old_img = media_path.with_suffix(exti)
+        if old_img.exists():
+            try:
+                os.replace(str(old_img), str(new_media.with_suffix(exti)))
+            except Exception:
+                pass
+
+    return new_media, new_json
+
+
 def _iso_date_from_upload(s: str | None) -> str:
     """yt-dlp upload_date -> YYYYMMDD → YYYY-MM-DD."""
     if not s or len(s) < 8:
@@ -682,6 +865,27 @@ def _pick_thumb(info: dict[str, Any]) -> str | None:
     return info.get("thumbnail") or None
 
 
+# Extensiones válidas de media (vídeo/audio) para emparejar con .info.json
+_MEDIA_EXTS = {
+    ".mp4",
+    ".mkv",
+    ".webm",
+    ".m4v",
+    ".mov",
+    ".avi",
+    ".flv",
+    ".ts",
+    ".m2ts",
+    ".mp3",
+    ".m4a",
+    ".aac",
+    ".opus",
+    ".ogg",
+    ".wav",
+    ".flac",
+}
+
+
 def _nfo_path_for_json(j: Path) -> Path:
     """
     Convierte 'Nombre [id].info.json' → 'Nombre [id].nfo'
@@ -693,224 +897,49 @@ def _nfo_path_for_json(j: Path) -> Path:
     return j.with_name(stem + ".nfo")
 
 
-def write_movie_nfo(info: dict[str, Any], nfo_path: Path) -> None:
-    """Genera movie.nfo para un vídeo suelto (Películas)."""
-    title = info.get("title") or info.get("fulltitle") or ""
-    fulltitle = info.get("fulltitle") or title
-    plot = info.get("description") or ""
-    duration = int(info.get("duration") or 0)
-    aired = _iso_date_from_upload(info.get("upload_date"))
-    studio = info.get("uploader") or info.get("channel") or ""
-    uid = info.get("id") or ""
-    rating = info.get("average_rating")  # 0..5 o 0..10 según extractor; Jellyfin acepta 0..10
-    thumb = _pick_thumb(info)
-    genre = _env_str("YTDLP_NFO_GENRE", "YouTube")
-
-    root = ET.Element("movie")
-    ET.SubElement(root, "title").text = _safe_text(title)
-    ET.SubElement(root, "originaltitle").text = _safe_text(fulltitle)
-    ET.SubElement(root, "sorttitle").text = _safe_text(fulltitle or title)
-    ET.SubElement(root, "plot").text = _safe_text(plot)
-    if duration > 0:
-        ET.SubElement(root, "runtime").text = str(max(1, duration // 60))
-    if aired:
-        ET.SubElement(root, "aired").text = aired
-        ET.SubElement(root, "premiered").text = aired
-    ET.SubElement(root, "dateadded").text = _safe_text(aired)
-    if studio:
-        ET.SubElement(root, "studio").text = _safe_text(studio)
-    if genre:
-        ET.SubElement(root, "genre").text = _safe_text(genre)
-    # tags útiles para navegar por canal/playlist
-    if info.get("uploader"):
-        ET.SubElement(root, "tag").text = _safe_text(info.get("uploader"))
-    if info.get("playlist_title"):
-        ET.SubElement(root, "tag").text = _safe_text(info.get("playlist_title"))
-    # rating si está disponible (no inventar)
-    if rating is not None:
-        ratings = ET.SubElement(root, "ratings")
-        r = ET.SubElement(ratings, "rating")
-        ET.SubElement(r, "name").text = "youtube"
-        try:
-            ET.SubElement(r, "value").text = f"{float(rating):.1f}"
-        except Exception:
-            ET.SubElement(r, "value").text = _safe_text(rating)
-        ET.SubElement(r, "max").text = "10"
-    uid_el = ET.SubElement(root, "uniqueid")
-    uid_el.set("type", "youtube")
-    uid_el.set("default", "true")
-    uid_el.text = _safe_text(uid)
-    if thumb:
-        ET.SubElement(root, "thumb").text = _safe_text(thumb)
-    nfo_path.parent.mkdir(parents=True, exist_ok=True)
-    ET.ElementTree(root).write(nfo_path, encoding="utf-8", xml_declaration=True)
-
-
-def write_episode_nfo(info: dict[str, Any], nfo_path: Path, *, season: int, episode: int) -> None:
-    """Genera NFO de episodio para bibliotecas de Series."""
-    title = info.get("title") or info.get("fulltitle") or ""
-    fulltitle = info.get("fulltitle") or title
-    plot = info.get("description") or ""
-    duration = int(info.get("duration") or 0)
-    aired = _iso_date_from_upload(info.get("upload_date"))
-    studio = info.get("uploader") or info.get("channel") or ""
-    uid = info.get("id") or ""
-    rating = info.get("average_rating")
-    thumb = _pick_thumb(info)
-    genre = _env_str("YTDLP_NFO_GENRE", "YouTube")
-
-    root = ET.Element("episodedetails")
-    ET.SubElement(root, "title").text = _safe_text(title)
-    ET.SubElement(root, "originaltitle").text = _safe_text(fulltitle)
-    ET.SubElement(root, "sorttitle").text = _safe_text(fulltitle or title)
-    ET.SubElement(root, "season").text = str(int(season))
-    ET.SubElement(root, "episode").text = str(int(episode))
-    if duration > 0:
-        ET.SubElement(root, "runtime").text = str(max(1, duration // 60))
-    if aired:
-        ET.SubElement(root, "aired").text = aired
-        ET.SubElement(root, "premiered").text = aired
-    ET.SubElement(root, "dateadded").text = _safe_text(aired)
-    ET.SubElement(root, "plot").text = _safe_text(plot)
-    if studio:
-        ET.SubElement(root, "studio").text = _safe_text(studio)
-    if genre:
-        ET.SubElement(root, "genre").text = _safe_text(genre)
-    if info.get("uploader"):
-        ET.SubElement(root, "tag").text = _safe_text(info.get("uploader"))
-    if info.get("playlist_title"):
-        ET.SubElement(root, "tag").text = _safe_text(info.get("playlist_title"))
-    if rating is not None:
-        ratings = ET.SubElement(root, "ratings")
-        r = ET.SubElement(ratings, "rating")
-        ET.SubElement(r, "name").text = "youtube"
-        try:
-            ET.SubElement(r, "value").text = f"{float(rating):.1f}"
-        except Exception:
-            ET.SubElement(r, "value").text = _safe_text(rating)
-        ET.SubElement(r, "max").text = "10"
-    uid_el = ET.SubElement(root, "uniqueid")
-    uid_el.set("type", "youtube")
-    uid_el.set("default", "true")
-    uid_el.text = _safe_text(uid)
-    if thumb:
-        ET.SubElement(root, "thumb").text = _safe_text(thumb)
-    nfo_path.parent.mkdir(parents=True, exist_ok=True)
-    ET.ElementTree(root).write(nfo_path, encoding="utf-8", xml_declaration=True)
-
-
-def ensure_tvshow_nfo(folder: Path, sample_info: dict[str, Any]) -> None:
-    """
-    Crea tvshow.nfo en 'folder' si no existe y hay señales de serie (playlist/canal).
-    Reglas (Jellyfin/Kodi): cada serie necesita un tvshow.nfo al nivel raíz. :contentReference[oaicite:5]index=5}
-    """
-    tv = folder / "tvshow.nfo"
-    if tv.exists():
-        return
-    title = (
-        sample_info.get("playlist_title")
-        or sample_info.get("uploader")
-        or sample_info.get("channel")
-        or "YouTube"
-    )
-    plot = (
-        sample_info.get("playlist")
-        or sample_info.get("playlist_title")
-        or sample_info.get("uploader")
-        or ""
-    )
-    studio = sample_info.get("uploader") or sample_info.get("channel") or ""
-    uid = (
-        sample_info.get("playlist_id")
-        or sample_info.get("channel_id")
-        or sample_info.get("uploader_id")
-        or ""
-    )
-    thumb = _pick_thumb(sample_info)
-
-    root = ET.Element("tvshow")
-    ET.SubElement(root, "title").text = _safe_text(title)
-    ET.SubElement(root, "originaltitle").text = _safe_text(title)
-    ET.SubElement(root, "sorttitle").text = _safe_text(title)
-    ET.SubElement(root, "plot").text = _safe_text(plot)
-    if studio:
-        ET.SubElement(root, "studio").text = _safe_text(studio)
-    ET.SubElement(root, "genre").text = _env_str("YTDLP_NFO_GENRE", "YouTube")
-    if uid:
-        uid_el = ET.SubElement(root, "uniqueid")
-        # Diferencia el tipo si lo sabemos
-        uid_el.set(
-            "type", "youtube_playlist" if sample_info.get("playlist_id") else "youtube_channel"
-        )
-        uid_el.set("default", "true")
-        uid_el.text = _safe_text(uid)
-    if thumb:
-        ET.SubElement(root, "thumb").text = _safe_text(thumb)
-    tv.parent.mkdir(parents=True, exist_ok=True)
-    ET.ElementTree(root).write(tv, encoding="utf-8", xml_declaration=True)
-
-
 def _emit_nfo_for_recent(outdir: Path) -> int:
     """
-    Recorre recursivamente *.info.json y genera:
-      - movie.nfo (archivo.nfo) para vídeos sueltos
-      - tvshow.nfo por carpeta + episodios si detecta playlist/canal
-    Comportamiento controlable por:
-      YTDLP_NFO_TV_MODE = auto|always|never
-      YTDLP_TV_SEASON_BY_YEAR = 0|1
+    Recorre recursivamente *.info.json, crea/actualiza NFO y normaliza series:
+      - Vídeo suelto → movie.nfo (en misma carpeta del media).
+      - Playlist/Radio → tvshow.nfo en carpeta del canal + episodios en Season YYYY con rename.
+    Sólo si hay media vecino.
     """
     tv_mode = _env_str("YTDLP_NFO_TV_MODE", "auto").lower()  # auto|always|never
-    season_by_year = _env_bool("YTDLP_TV_SEASON_BY_YEAR", False)
-
+    season_by_year = True  # forzamos temporadas por año en series (según tu especificación)
     created = 0
+
     for j in Path(outdir).rglob("*.info.json"):
         try:
             info = __import__("json").loads(j.read_text(encoding="utf-8"))
         except Exception:
             continue
 
-        folder = j.parent
-        # Nombre correcto del NFO junto al vídeo
-        nfo_path = _nfo_path_for_json(j)
+        media = _match_media_for_json(j)
+        if not media:
+            continue  # no NFO sin media
 
-        # Señales de playlist/canal
-        is_playlistish = bool(
+        is_playlist = bool(
             info.get("playlist_title") or info.get("playlist_id") or info.get("playlist_index")
         )
-        is_channelish = bool(info.get("uploader") or info.get("channel") or info.get("channel_id"))
-        # Conteo local de .info.json en la carpeta (para decidir auto-TV por "colección")
-        try:
-            count_here = sum(1 for _ in folder.glob("*.info.json"))
-        except Exception:
-            count_here = 1
 
-        if tv_mode == "always":
-            as_tv = True
-        elif tv_mode == "never":
-            as_tv = False
-        else:  # auto
-            # TV si es playlist, o si hay colección de videos (≥2) en la misma carpeta del canal/playlist
-            as_tv = is_playlistish or (is_channelish and count_here >= 2)
+        if (tv_mode != "never") and is_playlist:
+            # Normalizar layout de capítulo a Canal/Season YYYY/Canal - YYYYMMDD - Título [ID].ext
+            media, j = _ensure_episode_layout(info, j, media)
+            channel_dir = media.parent.parent  # ...\Canal\Season YYYY
+            ensure_tvshow_nfo(channel_dir, info)
 
-        if as_tv:
-            # tvshow.nfo (una vez por carpeta)
-            try:
-                ensure_tvshow_nfo(folder, info)
-            except Exception:
-                pass
-            # episodio
-            if not nfo_path.exists():
-                if season_by_year and info.get("upload_date"):
-                    season = int(_safe_text(info.get("upload_date"))[:4])
-                else:
-                    season = 1
-                episode = int(info.get("playlist_index") or 1)
-                write_episode_nfo(info, nfo_path, season=season, episode=episode)
-                created += 1
+            # NFO del episodio (junto al media)
+            nfo = media.with_suffix(".nfo")
+            y, m, d = _upload_date_parts(info)
+            season = int(y) if (season_by_year and y) else 1
+            # episodio := MMDD si hay fecha; si no, playlist_index
+            episode = int(f"{m}{d}") if (m and d) else int(info.get("playlist_index") or 1)
+            write_episode_nfo(info, nfo, season=season, episode=episode)
+            created += 1 if nfo.exists() else 0
         else:
-            # movie
-            if not nfo_path.exists():
-                write_movie_nfo(info, nfo_path)
-                created += 1
+            # Vídeo suelto → movie.nfo en el mismo directorio del media
+            nfo = media.with_suffix(".nfo")
+            write_movie_nfo(info, nfo)
+            created += 1 if nfo.exists() else 0
 
     return created

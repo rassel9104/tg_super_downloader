@@ -30,11 +30,11 @@ except Exception:
             self.YTDLP_COOKIES = None
             self.YTDLP_PROXY = None
             self.YTDLP_FORCE_IPV4 = False
-            self.YTDLP_COOKIES_MODE = "auto"  # 'browser', 'file', 'off', 'auto'
+            self.YTDLP_COOKIES_MODE: str = "file"  # 'browser', 'file', 'off', 'auto'
 
         YTDLP_BROWSER = "edge"  # 'chrome', 'chromium', 'edge', 'firefox', 'brave'
         YTDLP_BROWSER_PROFILE = "Default"
-        YTDLP_COOKIES_FILE = r"data\cookies\youtube.txt"
+        YTDLP_COOKIES_FILE: str = r"data\cookies\youtube.txt"
         YTDLP_WRITE_SUBS = True
         YTDLP_SUB_LANGS = "es,es-419,es-ES"
         YTDLP_CONVERT_SUBS = "srt"  # 'srt', 'vtt', ''
@@ -291,13 +291,6 @@ def _cookies_args() -> list[str]:
 
 def _looks_dpapi(lines: list[str]) -> bool:
     return any("Failed to decrypt with DPAPI" in ln for ln in (lines or []))
-
-
-def _looks_subs_429(lines: list[str]) -> bool:
-    if not lines:
-        return False
-    s = "\n".join(lines)
-    return ("Unable to download video subtitles" in s and "429" in s) or "HTTP Error 429" in s
 
 
 def _subfolder_mode() -> str:
@@ -596,17 +589,27 @@ async def download_proc(
 
     # Si falló por DPAPI y estamos en 'auto'/'browser': intentar con cookies de archivo si existen
     if _looks_dpapi(lines) and settings.YTDLP_COOKIES_MODE in {"auto", "browser"}:
-        cookie_file = getattr(settings, "YTDLP_COOKIES_FILE", r"data\cookies\youtube.txt")
-        if os.path.exists(cookie_file):
+        cookie_file = _resolve_cookie_file()
+        if cookie_file.exists():
             logger.warning(
-                "[YTDLP][retry] DPAPI detectado → usando cookies de archivo: %s", cookie_file
+                "[YTDLP][retry] DPAPI detectado → usando cookies de archivo: %s", str(cookie_file)
             )
             saved_mode = settings.YTDLP_COOKIES_MODE
+            saved_file = getattr(settings, "YTDLP_COOKIES_FILE", None)
             try:
-                settings.YTDLP_COOKIES_MODE = "file"
+                # Asegura que _common_args pase --cookies con la ruta correcta
+                settings.YTDLP_COOKIES_FILE = str(cookie_file)
                 okf, linesf = await _run(use_cookies=True, with_subs=True)
             finally:
                 settings.YTDLP_COOKIES_MODE = saved_mode
+                # Restaurar valor previo (o limpiar si no existía)
+                try:
+                    if saved_file is None:
+                        delattr(settings, "YTDLP_COOKIES_FILE")
+                    else:
+                        settings.YTDLP_COOKIES_FILE = saved_file
+                except Exception:
+                    pass
             if okf:
                 if getattr(settings, "YTDLP_METADATA_NFO", True):
                     with contextlib.suppress(Exception):
@@ -668,6 +671,42 @@ async def download_proc(
 
 
 # ================= NFO helpers (Jellyfin/Emby/Kodi) =================
+
+_MEDIA_EXTS = {
+    ".mp4",
+    ".mkv",
+    ".webm",
+    ".m4v",
+    ".mov",
+    ".avi",
+    ".flv",
+    ".ts",
+    ".m2ts",
+    ".mp3",
+    ".m4a",
+    ".aac",
+    ".opus",
+    ".ogg",
+    ".wav",
+    ".flac",
+}
+# Ruta por defecto (safe en Windows) para cookies YouTube (Netscape)
+DEFAULT_COOKIES_FILE = Path("data") / "cookies" / "youtube.txt"
+
+
+def _resolve_cookie_file() -> Path:
+    """
+    Devuelve la ruta de cookies (settings.YTDLP_COOKIES_FILE si está definida y no vacía),
+    o bien la ruta por defecto data/cookies/youtube.txt.
+    """
+    try:
+        v = getattr(settings, "YTDLP_COOKIES_FILE", None)
+        if v:
+            p = Path(str(v))
+            return p
+    except Exception:
+        pass
+    return DEFAULT_COOKIES_FILE
 
 
 def _safe_name(s: str) -> str:

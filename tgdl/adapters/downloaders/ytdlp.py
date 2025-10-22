@@ -207,6 +207,17 @@ def _looks_fmt_unavailable(lines: list[str]) -> bool:
     return any(_RE_FMT_UNAVAILABLE.search(ln or "") for ln in (lines or []))
 
 
+# 429 en subtítulos (patrones vistos en yt-dlp)
+_RE_SUBS_429 = re.compile(
+    r"(Unable to download video subtitles.*429|HTTP\s+Error\s+429.*subtitles?)",
+    re.I,
+)
+
+
+def _looks_subs_429(lines: list[str]) -> bool:
+    return any(_RE_SUBS_429.search(ln or "") for ln in (lines or []))
+
+
 _RE_SIGNIN_BOT = re.compile(r"Sign in to confirm you(?:'|’)re not a bot", re.I)
 
 
@@ -639,6 +650,15 @@ async def download_proc(
             with contextlib.suppress(Exception):
                 _emit_nfo_for_recent(outdir)
         return True
+    # NUEVO: si el 429 en subtítulos aparece AQUÍ (tras pasar a sin cookies), reintenta sin subtítulos
+    if _looks_subs_429(lines2) and not getattr(settings, "YTDLP_SUBS_REQUIRED", False):
+        logger.warning("[YTDLP][retry] 429 en subtítulos (sin cookies) → reintento sin subtítulos")
+        ok2_subless, _ = await _run(use_cookies=False, with_subs=False)
+        if ok2_subless:
+            if getattr(settings, "YTDLP_METADATA_NFO", True):
+                with contextlib.suppress(Exception):
+                    _emit_nfo_for_recent(outdir)
+            return True
 
     # Tail final si también falla sin cookies
     tail = lines2 or lines

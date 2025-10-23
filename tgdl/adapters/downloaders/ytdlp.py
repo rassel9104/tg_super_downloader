@@ -263,10 +263,7 @@ def _cookies_args() -> list[str]:
     mode = (getattr(settings, "YTDLP_COOKIES_MODE", "browser") or "browser").lower()
     browser = (getattr(settings, "YTDLP_BROWSER", "edge") or "edge").lower()
     profile = getattr(settings, "YTDLP_BROWSER_PROFILE", "Default") or "Default"
-    cookie_file = (
-        getattr(settings, "YTDLP_COOKIES_FILE", r"data\cookies\youtube.txt")
-        or "data\cookies\youtube.txt"
-    )
+    cookie_file = str(_resolve_cookie_file())
 
     def _browser_args():
         # FORMATO: --cookies-from-browser edge:Default
@@ -278,13 +275,13 @@ def _cookies_args() -> list[str]:
     if mode == "browser":
         return _browser_args()
     if mode == "file":
-        return _file_args() if os.path.exists(cookie_file) else []
+        return _file_args() if Path(cookie_file).exists() else []
     if mode == "off":
         return []
     # auto
     if browser:
         return _browser_args()
-    if os.path.exists(cookie_file):
+    if Path(cookie_file).exists():
         return _file_args()
     return []
 
